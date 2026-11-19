@@ -691,14 +691,44 @@ class Idlix : MainAPI() {
         private val MASTER_URL_REGEX = Regex("""majorplay\.net/v/[^?#]+/config-[^/?#]+\.json|\.m3u8""")
 
         // Requests logged while the WebView runs, to see how far the player got.
-        private val TRACE_URL_REGEX = Regex("""/api/watch/|majorplay\.net/|challenges\.cloudflare\.com/turnstile""")
+        private val TRACE_URL_REGEX = Regex("""/api/watch/|majorplay\.net/|challenges\.cloudflare\.com/""")
 
-        // Presses the hero play button, then the preroll skip button once its countdown ends
-        // ("Lewati dalam 5 dtk" turns into "Lewati Iklan"). Returns a short state string for the log.
+        // Runs on every request the WebView makes.
+        // - The resolver's WebView has no size, and the site's Turnstile widget only renders once its
+        //   container is wider than 0 (later size changes go through ResizeObserver and
+        //   requestAnimationFrame, which never fire in a page that is not shown). Give the container
+        //   a fixed width before the widget mounts.
+        // - Presses the hero play button, then the preroll skip button once its countdown ends
+        //   ("Lewati dalam 5 dtk" turns into "Lewati Iklan").
+        // - Returns a short state string for the log. When the state changes, it requests a .png
+        //   that the resolver answers locally (no network), only so this script runs again and the
+        //   new state reaches the log.
         private const val PLAYER_AUTOSTART_JS = """
             (function () {
+                var root = document.head || document.documentElement;
+                if (root && !document.getElementById('__csIdlixStyle')) {
+                    var st = document.createElement('style');
+                    st.id = '__csIdlixStyle';
+                    st.textContent = '.turnstile-probe,.turnstile-widget,.turnstile-widget__host'
+                        + '{display:block!important;width:320px!important;min-height:80px!important}';
+                    root.appendChild(st);
+                }
+                function state() {
+                    var s = [];
+                    if (document.querySelector('button.group.cursor-pointer.z-10')) s.push('play-button');
+                    var w = document.querySelector('.turnstile-widget');
+                    if (w) s.push('turnstile w=' + w.clientWidth + ' rendered=' + (w.dataset.rendered || '-')
+                        + ' size=' + (w.dataset.size || '-'));
+                    if (document.querySelector('.turnstile-probe')) s.push('probe');
+                    if (document.querySelector('.player-status__check')) s.push('turnstile-interactive');
+                    var pill = document.querySelector('.player-pill--status');
+                    if (pill) s.push('status: ' + (pill.innerText || '').trim().slice(0, 80));
+                    if (document.querySelector('video')) s.push('video');
+                    return s.join(', ') || 'waiting';
+                }
                 if (!window.__csIdlixAuto) {
                     window.__csIdlixAuto = true;
+                    var last = '';
                     setInterval(function () {
                         var play = document.querySelector('button.group.cursor-pointer.z-10');
                         if (play) play.click();
@@ -706,15 +736,14 @@ class Idlix : MainAPI() {
                             var t = (b.innerText || '').trim();
                             if (!b.disabled && /^(skip ad|lewati iklan)/i.test(t)) b.click();
                         });
+                        var now = state();
+                        if (now !== last) {
+                            last = now;
+                            new Image().src = location.origin + '/__cs_state.png?' + Date.now();
+                        }
                     }, 1000);
                 }
-                var s = [];
-                if (document.querySelector('button.group.cursor-pointer.z-10')) s.push('play-button');
-                if (document.querySelector('.turnstile-probe')) s.push('turnstile-probe');
-                if (document.querySelector('.player-status__check')) s.push('turnstile-interactive');
-                var pill = document.querySelector('.player-pill--status');
-                if (pill) s.push('status: ' + (pill.innerText || '').trim().slice(0, 80));
-                return s.join(', ') || 'waiting';
+                return state();
             })();
         """
     }
