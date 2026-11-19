@@ -903,7 +903,7 @@ class Idlix : MainAPI() {
 
         // For testing the token refresh: the first token is treated as running out this many
         // seconds after the stream starts (0 = off).
-        private const val FORCE_REFRESH_AFTER_SEC = 180L
+        private const val FORCE_REFRESH_AFTER_SEC = 0L
 
         // Request the injected script makes to hand the claim/redeem data to the extension.
         private const val SESSION_PATH = "/__cs_session.png"
