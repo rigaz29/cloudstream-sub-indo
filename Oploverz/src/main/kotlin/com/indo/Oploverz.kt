@@ -1,11 +1,11 @@
 package com.indo
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
+import org.jsoup.parser.Parser
+import java.net.URLEncoder
 import java.util.Base64
 
 class Oploverz : MainAPI() {
@@ -24,6 +24,23 @@ class Oploverz : MainAPI() {
                 else -> ShowStatus.Completed
             }
         }
+
+        // Blogger and Upbolt stream URLs refuse requests without a browser user agent (403), so the
+        // pages are fetched with this one and the links carry the same.
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+
+        private val BACKSLASH = 92.toChar().toString()
+
+        // \uXXXX escapes in the JSON that Blogger embeds in its page.
+        private val UNICODE_ESCAPE = Regex(Regex.escape(BACKSLASH) + "u([0-9a-fA-F]{4})")
+
+        private val GOOGLEVIDEO_URL =
+            Regex("""https://[a-z0-9.-]+\.googlevideo\.com/videoplayback\?[^"'\s<>""" + BACKSLASH + BACKSLASH + "]+")
+
+        private val ITAG = Regex("""[?&]itag=(\d+)""")
+
+        private val JW_SOURCE = Regex("""sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']""")
     }
 
     override val mainPage = mainPageOf(
@@ -82,11 +99,14 @@ class Oploverz : MainAPI() {
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val document = app.get("$mainUrl/?s=$query").document
-        return document.select("div.bsx, article.bs").mapNotNull { el ->
+        val q = URLEncoder.encode(query, "UTF-8")
+        val document = app.get("$mainUrl/?s=$q").document
+        return document.select("div.bsx").mapNotNull { el ->
             val a = el.selectFirst("a[href]") ?: return@mapNotNull null
             val href = a.attr("href").ifBlank { null } ?: return@mapNotNull null
-            val title = el.selectFirst("div.tt h4, h4, .tt")?.text()?.trim()
+            // div.tt holds the title as its own text and the same title again in an h2.
+            val title = el.selectFirst("div.tt")?.ownText()?.trim()?.ifBlank { null }
+                ?: el.selectFirst("h2")?.text()?.trim()?.ifBlank { null }
                 ?: a.attr("title").ifBlank { null } ?: return@mapNotNull null
             val poster = el.selectFirst("img")?.attr("src")?.ifBlank { null }
             newAnimeSearchResponse(title, href, TvType.Anime) { this.posterUrl = poster }
@@ -110,7 +130,10 @@ class Oploverz : MainAPI() {
             ?.replace(Regex("\\s*Subtitle\\s*Indonesia.*", RegexOption.IGNORE_CASE), "")
             ?.trim() ?: throw ErrorLoadingException("Title not found")
 
-        val poster = document.selectFirst("div.thumb img, img[src*=upload]")?.attr("src")?.ifBlank { null }
+        // The site logo also lives under wp-content/uploads, so do not pick the first upload image.
+        val poster = (document.selectFirst("div.thumb img")
+            ?: document.selectFirst("div.bigcontent img, div.infox img, img.wp-post-image"))
+            ?.attr("src")?.ifBlank { null }
         val description = document.selectFirst("div.entry-content > p, div.synp p")?.text()?.trim()
         val genres = document.select("a[href*=genres]").map { it.text() }.filter { it.isNotBlank() }
         val statusText = document.selectFirst("div.spe span:contains(Status)")
@@ -146,51 +169,56 @@ class Oploverz : MainAPI() {
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val document = app.get(data).document
 
-        // Button servers (dsu-server)
+        // The server buttons (data-url and base64 data-embed), the player iframe and the mirror
+        // options usually point at the same few embeds; collect them once.
+        val embeds = linkedSetOf<String>()
         document.select("button.dsu-server").forEach { btn ->
-            val dataUrl = btn.attr("data-url").ifBlank { null }
-            if (dataUrl != null && dataUrl.startsWith("http")) {
-                handleUrl(dataUrl, data, subtitleCallback, callback)
-            }
-
-            val dataEmbed = btn.attr("data-embed").ifBlank { null }
-            if (dataEmbed != null) {
-                val decoded = try { String(Base64.getDecoder().decode(dataEmbed)) } catch (_: Exception) { null }
-                if (decoded != null) {
-                    val src = Regex("""src\s*=\s*["']([^"']+)["']""").find(decoded)?.groupValues?.getOrNull(1)
-                    if (src != null && src.startsWith("http")) {
-                        handleUrl(src, data, subtitleCallback, callback)
-                    }
-                }
-            }
+            fixEmbedUrl(btn.attr("data-url"))?.let(embeds::add)
+            btn.attr("data-embed").ifBlank { null }?.let { iframeSrc(decodeBase64(it)) }?.let(embeds::add)
         }
-
-        // Iframe dari player-embed & pembed
         document.select("div#pembed iframe, div.player-embed iframe, div.video-content iframe").forEach { iframe ->
-            val src = iframe.attr("src").ifBlank { null } ?: return@forEach
-            if (src.startsWith("http")) handleUrl(src, data, subtitleCallback, callback)
+            fixEmbedUrl(iframe.attr("src"))?.let(embeds::add)
+        }
+        document.select("select.mirror option").forEach { option ->
+            option.attr("value").ifBlank { null }?.let { iframeSrc(decodeBase64(it)) }?.let(embeds::add)
         }
 
-        // Mirror option values (base64 encoded iframes)
-        document.select("select.mirror option").forEach { option ->
-            val encoded = option.attr("value").ifBlank { null } ?: return@forEach
-            val decoded = try { String(Base64.getDecoder().decode(encoded)) } catch (_: Exception) { null } ?: return@forEach
-            val src = Regex("""src\s*=\s*["']([^"']+)["']""").find(decoded)?.groupValues?.getOrNull(1) ?: return@forEach
-            if (src.startsWith("http")) handleUrl(src, data, subtitleCallback, callback)
+        var found = false
+        val onLink: (ExtractorLink) -> Unit = { link ->
+            found = true
+            callback(link)
         }
+        embeds.forEach { handleUrl(it, data, subtitleCallback, onLink) }
 
         // Gofile & direct download links
-        document.select("a[href*=gofile.io], a.dsu-download[href]").forEach { a ->
-            val href = a.attr("href").ifBlank { null } ?: return@forEach
-            loadExtractor(href, data, subtitleCallback, callback)
-        }
+        document.select("a[href*=gofile.io], a.dsu-download[href]")
+            .mapNotNull { fixEmbedUrl(it.attr("href")) }
+            .distinct()
+            .forEach { loadExtractor(it, data, subtitleCallback, onLink) }
 
-        return true
+        return found
+    }
+
+    private fun decodeBase64(value: String): String? =
+        try { String(Base64.getDecoder().decode(value.trim())) } catch (_: Exception) { null }
+
+    private fun iframeSrc(html: String?): String? =
+        html?.let { Regex("""src\s*=\s*["']([^"']+)["']""").find(it)?.groupValues?.getOrNull(1) }
+            ?.let { fixEmbedUrl(it) }
+
+    private fun fixEmbedUrl(url: String?): String? {
+        val u = url?.trim().orEmpty()
+        return when {
+            u.startsWith("http") -> u
+            u.startsWith("//") -> "https:$u"
+            else -> null
+        }
     }
 
     private suspend fun handleUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
         when {
             url.contains("blogger.com") -> handleBloggerUrl(url, referer, subtitleCallback, callback)
+            url.contains("upbolt.") -> handleUpboltUrl(url, referer, callback)
             url.contains("vkspeed.com") -> handleVkspeedUrl(url, callback)
             url.contains("play.xtwap.top") || url.contains("xtwap.top") -> handleXtwapUrl(url, callback)
             else -> loadExtractor(url, referer, subtitleCallback, callback)
@@ -242,41 +270,74 @@ class Oploverz : MainAPI() {
         } catch (_: Exception) {}
     }
 
+    /**
+     * Blogger's video.g page no longer has the "streams":[...] block that the built-in extractor
+     * and the old parsing looked for. The stream URLs now sit in HTML-escaped JSON in the page:
+     * googlevideo videoplayback URLs with their itag (18 = 360p, 22 = 720p). They are tied to the IP
+     * that loaded the page and refuse requests without a browser user agent, so fetch the page with
+     * BROWSER_UA and send the same one with the links. The built-in extractor stays as a fallback.
+     */
     private suspend fun handleBloggerUrl(url: String, referer: String?, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit) {
-        // Try built-in Blogger extractor (may produce links for old-style pages)
-        loadExtractor(url, referer, subtitleCallback, callback)
-
-        // Manual parsing of the Blogger page (fallback for old-style pages)
+        var found = false
         try {
-            val doc = app.get(url).document
-            doc.select("script").forEach { script ->
-                val text = script.data()
-                val streamsStart = text.indexOf("\"streams\":[")
-                if (streamsStart >= 0) {
-                    val from = streamsStart + "\"streams\":[".length
-                    val end = text.indexOf(']', from)
-                    if (end > from) {
-                        val streamsJson = "[" + text.substring(from, end) + "]"
-                        tryParseJson<List<ResponseSource>>(streamsJson)?.forEach { source ->
-                            callback(
-                                newExtractorLink(name, name, source.play_url) {
-                                    this.referer = "https://www.youtube.com/"
-                                    this.quality = when (source.format_id) {
-                                        18 -> 360
-                                        22 -> 720
-                                        else -> Qualities.Unknown.value
-                                    }
-                                }
-                            )
-                        }
-                    }
+            val page = app.get(url, headers = mapOf("User-Agent" to BROWSER_UA), referer = referer).text
+            val text = UNICODE_ESCAPE.replace(Parser.unescapeEntities(page, false)) {
+                it.groupValues[1].toInt(16).toChar().toString()
+            }.replace(BACKSLASH + "/", "/")
+            val seenItags = mutableSetOf<String>()
+            GOOGLEVIDEO_URL.findAll(text).forEach { match ->
+                val videoUrl = match.value
+                val itag = ITAG.find(videoUrl)?.groupValues?.get(1) ?: return@forEach
+                if (!seenItags.add(itag)) return@forEach
+                val (label, quality) = when (itag) {
+                    "18" -> "360p" to Qualities.P360.value
+                    "22" -> "720p" to Qualities.P720.value
+                    "37" -> "1080p" to Qualities.P1080.value
+                    else -> "itag $itag" to Qualities.Unknown.value
                 }
+                callback(
+                    newExtractorLink("Blogger", "Blogger $label", videoUrl, type = ExtractorLinkType.VIDEO) {
+                        this.quality = quality
+                        this.headers = mapOf("User-Agent" to BROWSER_UA)
+                    }
+                )
+                found = true
             }
-        } catch (_: Exception) { }
+        } catch (_: Exception) {}
+        if (!found) loadExtractor(url, referer, subtitleCallback, callback)
     }
 
-    private data class ResponseSource(
-        @param:JsonProperty("play_url") val play_url: String,
-        @param:JsonProperty("format_id") val format_id: Int
-    )
+    /**
+     * Upbolt is an XFileSharing host: its embed page only shows a play button that posts the embed
+     * form to /dl, and the answer is the player page with the HLS master in the jwplayer sources
+     * (sometimes inside packed JS). The master lists absolute variant URLs that carry their token.
+     */
+    private suspend fun handleUpboltUrl(url: String, referer: String?, callback: (ExtractorLink) -> Unit) {
+        try {
+            val host = Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: return
+            // Same as the embed page: last path part, after the last '-', without .html.
+            val code = url.substringBefore("?").trimEnd('/').substringAfterLast("/")
+                .removeSuffix(".html").substringAfterLast("-")
+            if (code.isBlank()) return
+            val page = app.post(
+                "$host/dl",
+                headers = mapOf("User-Agent" to BROWSER_UA, "Origin" to host),
+                referer = url,
+                data = mapOf("op" to "embed", "file_code" to code, "auto" to "1", "referer" to (referer ?: ""))
+            ).text
+            val stream = listOfNotNull(getPacked(page), page)
+                .firstNotNullOfOrNull { JW_SOURCE.find(it)?.groupValues?.get(1) }
+                ?.let { if (it.startsWith("//")) "https:$it" else it }
+                ?: return
+            callback(
+                newExtractorLink(
+                    "Upbolt", "Upbolt", stream,
+                    type = if (stream.contains(".m3u8")) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+                ) {
+                    this.referer = "$host/"
+                    this.headers = mapOf("User-Agent" to BROWSER_UA)
+                }
+            )
+        } catch (_: Exception) {}
+    }
 }
