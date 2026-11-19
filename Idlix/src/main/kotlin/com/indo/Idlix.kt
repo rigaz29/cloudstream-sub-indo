@@ -1,6 +1,7 @@
 package com.indo
 
 import android.util.Log
+import android.webkit.CookieManager
 import android.webkit.WebView
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.SubtitleFile
@@ -13,11 +14,19 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.JsonAsString
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
+import okhttp3.Request
+import okhttp3.Response
+import org.json.JSONArray
 import org.json.JSONObject
+import java.net.URLDecoder
 import java.net.URLEncoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 class Idlix : MainAPI() {
     override var mainUrl = "https://z3.idlixku.com"
@@ -294,7 +303,7 @@ class Idlix : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         if (tryLoadFromApi(data, subtitleCallback, callback)) return true
-        if (tryLoadFromWebView(data, callback)) return true
+        if (tryLoadFromWebView(data, subtitleCallback, callback)) return true
 
         var found = false
         val resp = app.get(data, interceptor = cfKiller)
@@ -535,6 +544,7 @@ class Idlix : MainAPI() {
                         subtitleCallback(newSubtitleFile(lang, subUrl))
                     }
                     val maxHeight = claimJson.optInt("maxHeight", 720)
+                    registerSession(streamUrl, claimJson, apiHeaders["User-Agent"], null)
                     emitStream(streamUrl, maxHeight, apiHeaders["User-Agent"], callback)
                     return true
                 }
@@ -542,6 +552,7 @@ class Idlix : MainAPI() {
 
             if (initialMaster.isNotBlank()) {
                 val maxHeight = claimJson.optInt("maxHeight", 720)
+                registerSession(initialMaster, claimJson, apiHeaders["User-Agent"], null)
                 emitStream(initialMaster, maxHeight, apiHeaders["User-Agent"], callback)
                 return true
             }
@@ -563,16 +574,26 @@ class Idlix : MainAPI() {
      * through OkHttp, which drops POST bodies (claim, redeem) and Set-Cookie (the `did` cookie set by
      * play-info), and a spoofed desktop user agent makes Turnstile fall back to an interactive check
      * that nobody can click in a hidden WebView.
+     *
+     * The injected script also copies the claim and redeem responses (claim, renewal token, master
+     * URL, subtitles) into a request the resolver answers locally; that gives the subtitles and what
+     * getVideoInterceptor needs to get a new stream token once the first one (1 hour) runs out.
+     * The master request itself stays as a fallback.
      */
-    private suspend fun tryLoadFromWebView(data: String, callback: (ExtractorLink) -> Unit): Boolean {
+    private suspend fun tryLoadFromWebView(
+        data: String,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
         // Stored links may still point at an older mirror domain.
         val pageUrl = data.substringBefore("#").replace(Regex("""^https?://[^/]+"""), mainUrl)
         var lastStatus = ""
+        val sessionData = AtomicReference<JSONObject?>(null)
         return try {
             if (DEBUG_WEBVIEW) withContext(Dispatchers.Main) { WebView.setWebContentsDebuggingEnabled(true) }
             val resolver = WebViewResolver(
                 interceptUrl = MASTER_URL_REGEX,
-                additionalUrls = listOf(TRACE_URL_REGEX),
+                additionalUrls = listOf(TRACE_URL_REGEX, SESSION_URL_REGEX),
                 userAgent = null,
                 useOkhttp = false,
                 script = PLAYER_AUTOSTART_JS,
@@ -591,19 +612,49 @@ class Idlix : MainAPI() {
                 headers = emptyMap(),
                 method = "GET"
             ) { req ->
-                Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
-                false
+                if (req.url.encodedPath == SESSION_PATH) {
+                    val json = req.url.queryParameter("d")?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    Log.d(TAG, "webview session: ${json?.keys()?.asSequence()?.toList()}")
+                    if (json != null) sessionData.set(json)
+                    json?.optString("url").isNullOrBlank().not()
+                } else {
+                    Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
+                    false
+                }
             }
-            if (request == null) {
+            val session = sessionData.get()
+            val streamUrl = session?.optString("url")?.ifBlank { null } ?: request?.url?.toString()
+            if (streamUrl == null) {
                 Log.d(TAG, "webview gave no stream, last player state: $lastStatus")
                 return false
             }
-            val userAgent = request.header("User-Agent") ?: WebViewResolver.webViewUserAgent
-            emitStream(request.url.toString(), 720, userAgent, callback)
+            val userAgent = request?.header("User-Agent") ?: WebViewResolver.webViewUserAgent
+            val cookie = runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
+            registerSession(streamUrl, session, userAgent, cookie)
+            session?.optJSONArray("subtitles")?.let { emitSubtitles(it, userAgent, subtitleCallback) }
+            emitStream(streamUrl, 720, userAgent, callback)
             true
         } catch (e: Exception) {
             Log.d(TAG, "webview failed: $e")
             false
+        }
+    }
+
+    private suspend fun emitSubtitles(
+        subs: JSONArray,
+        userAgent: String?,
+        subtitleCallback: (SubtitleFile) -> Unit
+    ) {
+        val subHeaders = mutableMapOf("Origin" to mainUrl, "Referer" to "$mainUrl/")
+        if (!userAgent.isNullOrBlank()) subHeaders["User-Agent"] = userAgent
+        for (i in 0 until subs.length()) {
+            val sub = subs.optJSONObject(i) ?: continue
+            val label = sub.optString("label").ifBlank { sub.optString("lang") }
+            val path = sub.optString("path")
+            if (label.isBlank() || path.isBlank()) continue
+            subtitleCallback(newSubtitleFile(label, if (path.startsWith("http")) path else fixUrl(path)) {
+                this.headers = subHeaders
+            })
         }
     }
 
@@ -645,34 +696,186 @@ class Idlix : MainAPI() {
     }
 
     /**
+     * One playback: the master's token and what is needed to get a new one. The stream token runs
+     * out an hour after redeem, the claim it came from lasts 12 hours, and the site gets a new
+     * master URL by redeeming the same claim again (or, once the claim is gone, renewing it with
+     * the renewal token). Neither needs another Turnstile check.
+     */
+    private class StreamSession(
+        masterUrl: HttpUrl,
+        var claim: String?,
+        var redeemUrl: String?,
+        var renewalToken: String?,
+        var progressToken: String?,
+        val userAgent: String?,
+        val cookie: String?
+    ) {
+        val pathPrefix: String = masterUrl.encodedPath.substringBeforeLast("/") + "/"
+        @Volatile var query: String = masterUrl.encodedQuery.orEmpty()
+        var lastRefreshAt = 0L
+
+        // Only for testing the refresh: makes the first token look like it runs out early.
+        @Volatile var forcedExpiry: Long =
+            if (FORCE_REFRESH_AFTER_SEC > 0) System.currentTimeMillis() / 1000 + FORCE_REFRESH_AFTER_SEC
+            else Long.MAX_VALUE
+
+        val canRefresh get() = claim != null || renewalToken != null
+
+        /** Expiry in epoch seconds, read from `t=c2_3/v/<zone>/<videoId>/.<expiry>-<sig>`. */
+        val expiresAt: Long
+            get() {
+                val t = runCatching { URLDecoder.decode(query, "UTF-8") }.getOrDefault(query)
+                val fromToken = Regex("""/\.(\d{9,11})-""").find(t)?.groupValues?.get(1)?.toLongOrNull()
+                    ?: Long.MAX_VALUE
+                return minOf(fromToken, forcedExpiry)
+            }
+
+        fun covers(url: HttpUrl) = url.encodedPath.startsWith(pathPrefix) && url.queryParameter("t") == null
+
+        fun sign(request: Request, withQuery: String): Request {
+            val url = request.url
+            val builder = url.newBuilder()
+            withQuery.split("&").forEach { pair ->
+                val key = pair.substringBefore("=")
+                if (key.isNotBlank() && url.queryParameter(key) == null) {
+                    builder.addEncodedQueryParameter(key, pair.substringAfter("=", ""))
+                }
+            }
+            return request.newBuilder().url(builder.build()).build()
+        }
+    }
+
+    private val sessions = ConcurrentHashMap<String, StreamSession>()
+
+    private fun registerSession(streamUrl: String, data: JSONObject?, userAgent: String?, cookie: String?) {
+        val master = streamUrl.toHttpUrlOrNull() ?: return
+        sessions[streamUrl] = StreamSession(
+            masterUrl = master,
+            claim = data?.optString("claim")?.ifBlank { null },
+            redeemUrl = data?.optString("redeemUrl")?.ifBlank { null },
+            renewalToken = data?.optString("renewalToken")?.ifBlank { null },
+            progressToken = data?.optString("progressToken")?.ifBlank { null },
+            userAgent = userAgent,
+            cookie = cookie
+        )
+    }
+
+    /**
      * The stream token is only on the master playlist URL, and the CDN refuses every other request
      * without it (401). Variant playlists are listed as paths without a query, and init maps and
      * segments sit on many unrelated hosts (`g3.<random>.website/v/z3/<videoId>/p/.../cover.jpg`).
      * The token is scoped to the path (`t=c2_3/v/z3/<videoId>/.<expiry>-<sig>`), so add the
-     * master's query parameters to every request under the master's directory, on any host.
+     * master's query parameters to every request under the master's directory, on any host, and
+     * get a new token when it is about to run out or the CDN refuses it.
      */
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
-        val master = extractorLink.url.toHttpUrlOrNull() ?: return null
-        if (master.queryParameter("t") == null) return null
-        val params = master.encodedQuery.orEmpty().split("&").mapNotNull { pair ->
-            val key = pair.substringBefore("=")
-            if (key.isBlank()) null else key to pair.substringAfter("=", "")
+        val session = sessions[extractorLink.url] ?: run {
+            val master = extractorLink.url.toHttpUrlOrNull() ?: return null
+            StreamSession(master, null, null, null, null, null, null)
         }
-        val pathPrefix = master.encodedPath.substringBeforeLast("/") + "/"
-        return Interceptor { chain ->
-            val request = chain.request()
-            val url = request.url
-            if (url.encodedPath.startsWith(pathPrefix) && url.queryParameter("t") == null) {
-                val builder = url.newBuilder()
-                params.forEach { (key, value) ->
-                    if (url.queryParameter(key) == null) builder.addEncodedQueryParameter(key, value)
-                }
-                chain.proceed(request.newBuilder().url(builder.build()).build())
-            } else {
-                chain.proceed(request)
-            }
-        }
+        if (session.query.isBlank()) return null
+        return Interceptor { chain -> interceptStream(chain, session) }
     }
+
+    private fun interceptStream(chain: Interceptor.Chain, session: StreamSession): Response {
+        val request = chain.request()
+        if (!session.covers(request.url)) return chain.proceed(request)
+        if (session.canRefresh && session.expiresAt - nowSec() < TOKEN_REFRESH_MARGIN_SEC) {
+            refreshStreamToken(session, usedQuery = null)
+        }
+        val used = session.query
+        val response = chain.proceed(session.sign(request, used))
+        if (response.code != 401 && response.code != 403) return response
+        Log.d(TAG, "stream request refused (${response.code}): ${request.url.encodedPath}")
+        if (!session.canRefresh || !refreshStreamToken(session, usedQuery = used)) return response
+        response.close()
+        return chain.proceed(session.sign(request, session.query))
+    }
+
+    /**
+     * Gets a new master URL for [session] and takes its token. Requests run in parallel, so only one
+     * of them refreshes: [usedQuery] is the token a refused request carried (null for a refresh ahead
+     * of expiry); if the session already moved past it, there is nothing to do.
+     */
+    private fun refreshStreamToken(session: StreamSession, usedQuery: String?): Boolean = synchronized(session) {
+        if (usedQuery != null && session.query != usedQuery) return@synchronized true
+        if (usedQuery == null && session.expiresAt - nowSec() >= TOKEN_REFRESH_MARGIN_SEC) return@synchronized true
+        if (nowSec() - session.lastRefreshAt < 15) return@synchronized false
+        session.lastRefreshAt = nowSec()
+        val newUrl = runCatching { runBlocking { redeemStream(session) } }
+            .onFailure { Log.d(TAG, "token refresh failed: $it") }
+            .getOrNull()
+            ?.toHttpUrlOrNull()
+        if (newUrl == null) {
+            Log.d(TAG, "token refresh gave no stream URL")
+            return@synchronized false
+        }
+        val newPrefix = newUrl.encodedPath.substringBeforeLast("/") + "/"
+        if (newPrefix != session.pathPrefix) Log.d(TAG, "token refresh moved the stream to $newPrefix")
+        session.query = newUrl.encodedQuery.orEmpty()
+        session.forcedExpiry = Long.MAX_VALUE
+        Log.d(TAG, "stream token refreshed, expires at ${session.expiresAt}")
+        true
+    }
+
+    private suspend fun redeemStream(session: StreamSession): String? {
+        session.claim?.let { claim -> postRedeem(session, claim)?.let { return it } }
+        // The claim ran out (redeem answers 410): renew it, then redeem the new one.
+        val renewal = session.renewalToken ?: return null
+        val payload = JSONObject().put("renewalToken", renewal)
+        session.progressToken?.let { payload.put("progressToken", it) }
+        val resp = app.post(
+            "$mainUrl/api/watch/session/refresh-claim",
+            headers = sessionHeaders(session, withCookie = true),
+            json = JsonAsString(payload.toString())
+        )
+        val json = runCatching { JSONObject(resp.text) }.getOrNull()
+            ?.takeIf { it.optString("kind") == "pentos" && it.optString("claim").isNotBlank() }
+        if (json == null) {
+            Log.d(TAG, "claim renewal refused (${resp.code})")
+            return null
+        }
+        val claim = json.optString("claim")
+        session.claim = claim
+        json.optString("renewalToken").ifBlank { null }?.let { session.renewalToken = it }
+        json.optString("progressToken").ifBlank { null }?.let { session.progressToken = it }
+        json.optString("redeemUrl").ifBlank { null }?.let { session.redeemUrl = it }
+        return postRedeem(session, claim)
+    }
+
+    private suspend fun postRedeem(session: StreamSession, claim: String): String? {
+        val raw = session.redeemUrl.orEmpty()
+        val external = raw.startsWith("http")
+        val url = when {
+            external -> raw
+            raw.isNotBlank() -> mainUrl + (if (raw.startsWith("/api")) "" else "/api") + raw
+            else -> "$mainUrl/api/watch/session/redeem"
+        }
+        val resp = app.post(
+            url,
+            headers = sessionHeaders(session, withCookie = !external),
+            json = JsonAsString(JSONObject().put("claim", claim).put("mode", "browser").toString())
+        )
+        if (!resp.isSuccessful) {
+            Log.d(TAG, "redeem refused (${resp.code})")
+            return null
+        }
+        return runCatching { JSONObject(resp.text).optString("url") }.getOrNull()?.ifBlank { null }
+    }
+
+    private fun sessionHeaders(session: StreamSession, withCookie: Boolean): Map<String, String> {
+        val headers = mutableMapOf(
+            "Accept" to "application/json",
+            "Content-Type" to "application/json",
+            "Origin" to mainUrl,
+            "Referer" to "$mainUrl/"
+        )
+        session.userAgent?.let { headers["User-Agent"] = it }
+        if (withCookie) session.cookie?.let { headers["Cookie"] = it }
+        return headers
+    }
+
+    private fun nowSec() = System.currentTimeMillis() / 1000
 
     private fun parseQuality(q: String): Int {
         return when {
@@ -695,6 +898,17 @@ class Idlix : MainAPI() {
         // Lets the hidden WebView be inspected over adb (chrome://inspect) while testing.
         private const val DEBUG_WEBVIEW = false
 
+        // Get a new stream token this long before the current one runs out.
+        private const val TOKEN_REFRESH_MARGIN_SEC = 120L
+
+        // For testing the token refresh: the first token is treated as running out this many
+        // seconds after the stream starts (0 = off).
+        private const val FORCE_REFRESH_AFTER_SEC = 180L
+
+        // Request the injected script makes to hand the claim/redeem data to the extension.
+        private const val SESSION_PATH = "/__cs_session.png"
+        private val SESSION_URL_REGEX = Regex("""/__cs_session\.png\?""")
+
         private val MASTER_URL_REGEX = Regex("""majorplay\.net/v/[^?#]+/config-[^/?#]+\.json|\.m3u8""")
 
         // Requests logged while the WebView runs, to see how far the player got.
@@ -712,6 +926,10 @@ class Idlix : MainAPI() {
         // - The player module also loads a CSS chunk; its failed load rejects the chunk
         //   (ChunkLoadError) and the page shows an error instead of the player. Stop the error
         //   from reaching the chunk loader and fire `load` on the link instead.
+        // - Wraps fetch to copy the claim response (claim, renewal token) and the redeem response
+        //   (master URL, subtitles), and hands them over in a request to SESSION_PATH. The site only
+        //   gets the redeem response after that request has gone out, so it arrives before the
+        //   master request.
         // - Presses the hero play button, then the preroll skip button once its countdown ends
         //   ("Lewati dalam 5 dtk" turns into "Lewati Iklan").
         // - Returns a short state string for the log. When the state changes, it requests a .png
@@ -728,6 +946,31 @@ class Idlix : MainAPI() {
                             setTimeout(function () { t.dispatchEvent(new Event('load')); }, 0);
                         }
                     }, true);
+                }
+                if (!window.__csIdlixFetch && window.fetch) {
+                    window.__csIdlixFetch = true;
+                    var origFetch = window.fetch, session = {};
+                    window.fetch = function (input) {
+                        var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+                        var p = origFetch.apply(this, arguments);
+                        if (!/\/watch\/session\/|majorplay\.net\/api\//.test(url)) return p;
+                        return p.then(function (res) {
+                            return res.clone().json().then(function (j) {
+                                if (j && j.kind === 'pentos' && j.claim) {
+                                    session.claim = j.claim;
+                                    session.redeemUrl = j.redeemUrl;
+                                    session.renewalToken = j.renewalToken;
+                                    session.progressToken = j.progressToken;
+                                } else if (j && j.url && j.mode === 'browser') {
+                                    session.url = j.url;
+                                    session.subtitles = j.subtitles || [];
+                                    new Image().src = location.origin + '/__cs_session.png?d='
+                                        + encodeURIComponent(JSON.stringify(session));
+                                }
+                                return res;
+                            }, function () { return res; });
+                        });
+                    };
                 }
                 var root = document.head || document.documentElement;
                 if (root && !document.getElementById('__csIdlixStyle')) {
