@@ -1,6 +1,7 @@
 package com.indo
 
 import android.util.Log
+import android.webkit.WebView
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.network.CloudflareKiller
@@ -10,7 +11,9 @@ import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.JsonAsString
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import org.json.JSONObject
@@ -566,6 +569,7 @@ class Idlix : MainAPI() {
         val pageUrl = data.substringBefore("#").replace(Regex("""^https?://[^/]+"""), mainUrl)
         var lastStatus = ""
         return try {
+            if (DEBUG_WEBVIEW) withContext(Dispatchers.Main) { WebView.setWebContentsDebuggingEnabled(true) }
             val resolver = WebViewResolver(
                 interceptUrl = MASTER_URL_REGEX,
                 additionalUrls = listOf(TRACE_URL_REGEX),
@@ -688,16 +692,23 @@ class Idlix : MainAPI() {
     companion object {
         private const val TAG = "Idlix"
 
+        // Lets the hidden WebView be inspected over adb (chrome://inspect) while testing.
+        private const val DEBUG_WEBVIEW = true
+
         private val MASTER_URL_REGEX = Regex("""majorplay\.net/v/[^?#]+/config-[^/?#]+\.json|\.m3u8""")
 
         // Requests logged while the WebView runs, to see how far the player got.
         private val TRACE_URL_REGEX = Regex("""/api/watch/|majorplay\.net/|challenges\.cloudflare\.com/""")
 
         // Runs on every request the WebView makes.
-        // - The resolver's WebView has no size, and the site's Turnstile widget only renders once its
-        //   container is wider than 0 (later size changes go through ResizeObserver and
-        //   requestAnimationFrame, which never fire in a page that is not shown). Give the container
-        //   a fixed width before the widget mounts.
+        // - The site's Turnstile widget only renders once its container is wider than 0 (later size
+        //   changes go through ResizeObserver and requestAnimationFrame, which never fire in a page
+        //   that is not shown). Two things keep it at 0 in the resolver's WebView: the WebView has
+        //   no size, and the resolver answers .css requests with an empty body, so the site's asset
+        //   check marks the page `nb-asset-failed`, whose inline rule hides every direct child of
+        //   body with `display: none !important` - including the Turnstile probe, which is portaled
+        //   into body. Give the container a fixed width and override that rule for the probe with a
+        //   more specific selector (1,1,3 against 1,1,2).
         // - Presses the hero play button, then the preroll skip button once its countdown ends
         //   ("Lewati dalam 5 dtk" turns into "Lewati Iklan").
         // - Returns a short state string for the log. When the state changes, it requests a .png
@@ -710,11 +721,13 @@ class Idlix : MainAPI() {
                     var st = document.createElement('style');
                     st.id = '__csIdlixStyle';
                     st.textContent = '.turnstile-probe,.turnstile-widget,.turnstile-widget__host'
-                        + '{display:block!important;width:320px!important;min-height:80px!important}';
+                        + '{display:block!important;width:320px!important;min-height:80px!important}'
+                        + 'html body>div.turnstile-probe:not(#__cs_none){display:block!important}';
                     root.appendChild(st);
                 }
                 function state() {
                     var s = [];
+                    if (/\bnb-asset-failed\b/.test(document.documentElement.className)) s.push('asset-failed');
                     if (document.querySelector('button.group.cursor-pointer.z-10')) s.push('play-button');
                     var w = document.querySelector('.turnstile-widget');
                     if (w) s.push('turnstile w=' + w.clientWidth + ' rendered=' + (w.dataset.rendered || '-')
