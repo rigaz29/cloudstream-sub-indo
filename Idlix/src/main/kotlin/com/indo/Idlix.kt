@@ -31,7 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 class Idlix : MainAPI() {
-    override var mainUrl = "https://z2.idlixku.com"
+    override var mainUrl = "https://z3.idlixku.com"
     override var name = "Idlix"
     override val hasMainPage = true
     override var lang = "id"
