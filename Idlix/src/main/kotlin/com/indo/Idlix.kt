@@ -709,6 +709,9 @@ class Idlix : MainAPI() {
         //   body with `display: none !important` - including the Turnstile probe, which is portaled
         //   into body. Give the container a fixed width and override that rule for the probe with a
         //   more specific selector (1,1,3 against 1,1,2).
+        // - The player module also loads a CSS chunk; its failed load rejects the chunk
+        //   (ChunkLoadError) and the page shows an error instead of the player. Stop the error
+        //   from reaching the chunk loader and fire `load` on the link instead.
         // - Presses the hero play button, then the preroll skip button once its countdown ends
         //   ("Lewati dalam 5 dtk" turns into "Lewati Iklan").
         // - Returns a short state string for the log. When the state changes, it requests a .png
@@ -716,6 +719,16 @@ class Idlix : MainAPI() {
         //   new state reaches the log.
         private const val PLAYER_AUTOSTART_JS = """
             (function () {
+                if (!window.__csIdlixCss) {
+                    window.__csIdlixCss = true;
+                    window.addEventListener('error', function (e) {
+                        var t = e.target;
+                        if (t && t.tagName === 'LINK' && /\/_next\/static\/.+\.css/.test(t.href || '')) {
+                            e.stopImmediatePropagation();
+                            setTimeout(function () { t.dispatchEvent(new Event('load')); }, 0);
+                        }
+                    }, true);
+                }
                 var root = document.head || document.documentElement;
                 if (root && !document.getElementById('__csIdlixStyle')) {
                     var st = document.createElement('style');
