@@ -645,10 +645,11 @@ class Idlix : MainAPI() {
     }
 
     /**
-     * The stream token is only on the master playlist URL. Variant playlists, init maps and segments
-     * are listed with relative URIs, which drop the query when resolved, and the CDN refuses them
-     * without the token. Add the master's query parameters to every request on the stream domain
-     * that does not carry its own token.
+     * The stream token is only on the master playlist URL, and the CDN refuses every other request
+     * without it (401). Variant playlists are listed as paths without a query, and init maps and
+     * segments sit on many unrelated hosts (`g3.<random>.website/v/z3/<videoId>/p/.../cover.jpg`).
+     * The token is scoped to the path (`t=c2_3/v/z3/<videoId>/.<expiry>-<sig>`), so add the
+     * master's query parameters to every request under the master's directory, on any host.
      */
     override fun getVideoInterceptor(extractorLink: ExtractorLink): Interceptor? {
         val master = extractorLink.url.toHttpUrlOrNull() ?: return null
@@ -657,12 +658,11 @@ class Idlix : MainAPI() {
             val key = pair.substringBefore("=")
             if (key.isBlank()) null else key to pair.substringAfter("=", "")
         }
-        val domain = master.host.split(".").takeLast(2).joinToString(".")
+        val pathPrefix = master.encodedPath.substringBeforeLast("/") + "/"
         return Interceptor { chain ->
             val request = chain.request()
             val url = request.url
-            val onStreamDomain = url.host == domain || url.host.endsWith(".$domain")
-            if (onStreamDomain && url.queryParameter("t") == null) {
+            if (url.encodedPath.startsWith(pathPrefix) && url.queryParameter("t") == null) {
                 val builder = url.newBuilder()
                 params.forEach { (key, value) ->
                     if (url.queryParameter(key) == null) builder.addEncodedQueryParameter(key, value)
@@ -693,7 +693,7 @@ class Idlix : MainAPI() {
         private const val TAG = "Idlix"
 
         // Lets the hidden WebView be inspected over adb (chrome://inspect) while testing.
-        private const val DEBUG_WEBVIEW = true
+        private const val DEBUG_WEBVIEW = false
 
         private val MASTER_URL_REGEX = Regex("""majorplay\.net/v/[^?#]+/config-[^/?#]+\.json|\.m3u8""")
 
