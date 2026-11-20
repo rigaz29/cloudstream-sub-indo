@@ -208,26 +208,57 @@ class Hanime : MainAPI() {
         // Requests logged while the WebView runs, to see how far the player got.
         private val TRACE_URL_REGEX = Regex("""hanime\.tv/|freeanimehentai\.net/|/manifest|challenges\.cloudflare\.com/""")
 
-        // Presses common play buttons and starts any <video> in the page (muted), once a second.
-        // Returns a short state string for the log: frames, videos and a Cloudflare page flag.
+        // Runs on every request the WebView makes, and its own loop once a second:
+        // - The page is built from Astro islands, and the player is a client="visible" island: it
+        //   only hydrates once an IntersectionObserver reports it on screen, which never happens in
+        //   the resolver's WebView (no size, not shown). Island.start() reads the client attribute
+        //   each time, so switch those islands to "load" and start them.
+        // - Press the player poster ("Play video"), then start the <video> (muted) if it waits.
+        // Returns a short state string for the log.
         private const val AUTOPLAY_JS = """
             (function () {
+                function tick() {
+                    document.querySelectorAll('astro-island[client="visible"]').forEach(function (el) {
+                        if (el.__csStarted || typeof el.start !== 'function') return;
+                        el.__csStarted = true;
+                        el.setAttribute('client', 'load');
+                        try { el.start(); } catch (e) {}
+                    });
+                    // The resolver blanks .css, so the poster never looks hidden; press it a few
+                    // times at most (3 s apart) so a started player is not toggled again and again.
+                    var poster = document.querySelector('[aria-label="Play video"]');
+                    var now = Date.now();
+                    if (poster && (window.__csPosterClicks || 0) < 3 && now - (window.__csPosterAt || 0) > 3000) {
+                        window.__csPosterClicks = (window.__csPosterClicks || 0) + 1;
+                        window.__csPosterAt = now;
+                        poster.click();
+                    }
+                    document.querySelectorAll('video').forEach(function (v) {
+                        if (v.paused && v.readyState > 0) { v.muted = true; var p = v.play(); if (p && p.catch) p.catch(function () {}); }
+                    });
+                }
+                function state() {
+                    var cf = /attention required|just a moment/i.test(document.title || '');
+                    return 'ready=' + document.readyState
+                        + ' islands-forced=' + document.querySelectorAll('astro-island[client="load"]').length
+                        + ' visible-left=' + document.querySelectorAll('astro-island[client="visible"]').length
+                        + ' play-btn=' + !!document.querySelector('[aria-label="Play video"]')
+                        + ' play-clicks=' + (window.__csPosterClicks || 0)
+                        + ' videos=' + document.querySelectorAll('video').length + (cf ? ' cloudflare' : '');
+                }
                 if (!window.__csHanime) {
                     window.__csHanime = true;
+                    var last = '';
                     setInterval(function () {
-                        ['.play-btn', '.vjs-big-play-button', 'button[aria-label="Play"]', '.plyr__control--overlaid',
-                         '.jw-display-icon-container', '[class*="play-button"]', '[class*="PlayButton"]'].forEach(function (s) {
-                            var b = document.querySelector(s);
-                            if (b) b.click();
-                        });
-                        document.querySelectorAll('video').forEach(function (v) {
-                            if (v.paused) { v.muted = true; var p = v.play && v.play(); if (p && p.catch) p.catch(function () {}); }
-                        });
+                        tick();
+                        // When the state changes, request a .png that the resolver answers locally
+                        // (no network), only so this script runs again and the state reaches the log.
+                        var now = state();
+                        if (now !== last) { last = now; new Image().src = location.origin + '/__cs_state.png?' + Date.now(); }
                     }, 1000);
                 }
-                var cf = /attention required|just a moment/i.test(document.title || '');
-                return 'ready=' + document.readyState + ' iframes=' + document.querySelectorAll('iframe').length
-                    + ' videos=' + document.querySelectorAll('video').length + (cf ? ' cloudflare' : '');
+                tick();
+                return state();
             })();
         """
     }
