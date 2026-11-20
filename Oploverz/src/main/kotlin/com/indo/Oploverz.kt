@@ -1,9 +1,11 @@
 package com.indo
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addAniListId
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Document
 import org.jsoup.parser.Parser
 import java.net.URLEncoder
 import java.util.Base64
@@ -24,6 +26,11 @@ class Oploverz : MainAPI() {
                 else -> ShowStatus.Completed
             }
         }
+
+        private const val TAG = "Oploverz"
+
+        // Series pages list 12 episodes per page; long series (One Piece) have a few dozen.
+        private const val MAX_EPISODE_PAGES = 60
 
         // Blogger and Upbolt stream URLs refuse requests without a browser user agent (403), so the
         // pages are fetched with this one and the links carry the same.
@@ -142,14 +149,20 @@ class Oploverz : MainAPI() {
         val year = document.selectFirst("div.spe span:contains(Released)")
             ?.text()?.let { Regex("\\b(20\\d{2})\\b").find(it)?.groupValues?.getOrNull(1)?.toIntOrNull() }
 
-        // Episode list dari halaman series
-        val episodes = document.select("div.eplister ul li, ul#episodelist li").mapNotNull { li ->
-            val a = li.selectFirst("a") ?: return@mapNotNull null
-            val href = a.attr("href").ifBlank { null } ?: return@mapNotNull null
-            val epNum = li.selectFirst("div.epl-num")?.text()?.trim()?.toIntOrNull()
-            val epTitle = li.selectFirst("div.epl-title")?.text()?.trim() ?: a.text().trim()
-            newEpisode(href) { this.name = epTitle; this.episode = epNum }
-        }.reversed()
+        // The episode list shows 12 per page (?ep_page=N, newest first), and the page links sit in
+        // the same <ul>; read every page and skip the page links.
+        val lastPage = document.select("div.eplister a.page-numbers[href*=ep_page]")
+            .mapNotNull { Regex("""ep_page=(\d+)""").find(it.attr("href"))?.groupValues?.get(1)?.toIntOrNull() }
+            .maxOrNull() ?: 1
+        val seriesUrl = finalUrl.substringBefore("?")
+        val morePages = (2..minOf(lastPage, MAX_EPISODE_PAGES)).toList().amap { page ->
+            runCatching { app.get("$seriesUrl?ep_page=$page").document }.getOrNull()
+        }
+        val episodes = (listOf(document) + morePages.filterNotNull())
+            .flatMap { parseEpisodes(it) }
+            .distinctBy { it.data }
+            .reversed()
+        Log.d(TAG, "load $seriesUrl: ${episodes.size} episodes from $lastPage page(s)")
 
         val tracker = APIHolder.getTracker(listOf(title), TrackerType.getTypes(TvType.Anime), year, true)
         return newAnimeLoadResponse(title, finalUrl, TvType.Anime) {
@@ -165,6 +178,17 @@ class Oploverz : MainAPI() {
             addAniListId(tracker?.aniId?.toIntOrNull())
         }
     }
+
+    private fun parseEpisodes(document: Document): List<Episode> =
+        document.select("div.eplister ul li, ul#episodelist li").mapNotNull { li ->
+            // Page links (1, 2, ...) share the list; real episodes have an epl-num.
+            val num = li.selectFirst("div.epl-num") ?: return@mapNotNull null
+            val a = li.selectFirst("a") ?: return@mapNotNull null
+            val href = a.attr("href").ifBlank { null } ?: return@mapNotNull null
+            val epNum = num.text().trim().toIntOrNull()
+            val epTitle = li.selectFirst("div.epl-title")?.text()?.trim() ?: a.text().trim()
+            newEpisode(href) { this.name = epTitle; this.episode = epNum }
+        }
 
     override suspend fun loadLinks(data: String, isCasting: Boolean, subtitleCallback: (SubtitleFile) -> Unit, callback: (ExtractorLink) -> Unit): Boolean {
         val document = app.get(data).document
@@ -183,21 +207,29 @@ class Oploverz : MainAPI() {
             option.attr("value").ifBlank { null }?.let { iframeSrc(decodeBase64(it)) }?.let(embeds::add)
         }
 
-        var found = false
-        val onLink: (ExtractorLink) -> Unit = { link ->
-            found = true
-            callback(link)
-        }
-        embeds.forEach { handleUrl(it, data, subtitleCallback, onLink) }
-
-        // Gofile & direct download links
-        document.select("a[href*=gofile.io], a.dsu-download[href]")
+        val downloads = document.select("a[href*=gofile.io], a.dsu-download[href]")
             .mapNotNull { fixEmbedUrl(it.attr("href")) }
             .distinct()
-            .forEach { loadExtractor(it, data, subtitleCallback, onLink) }
+        Log.d(TAG, "loadLinks $data: embeds ${embeds.map(::hostOf)}, downloads ${downloads.map(::hostOf)}")
 
-        return found
+        var total = 0
+        suspend fun collect(url: String, block: suspend ((ExtractorLink) -> Unit) -> Unit) {
+            var count = 0
+            block { link ->
+                count++
+                callback(link)
+            }
+            total += count
+            Log.d(TAG, "${hostOf(url)}: $count link(s)")
+        }
+        embeds.forEach { url -> collect(url) { cb -> handleUrl(url, data, subtitleCallback, cb) } }
+        // Gofile & direct download links
+        downloads.forEach { url -> collect(url) { cb -> loadExtractor(url, data, subtitleCallback, cb) } }
+
+        return total > 0
     }
+
+    private fun hostOf(url: String) = Regex("""^https?://([^/?#]+)""").find(url)?.groupValues?.get(1) ?: url
 
     private fun decodeBase64(value: String): String? =
         try { String(Base64.getDecoder().decode(value.trim())) } catch (_: Exception) { null }
@@ -303,8 +335,13 @@ class Oploverz : MainAPI() {
                 )
                 found = true
             }
-        } catch (_: Exception) {}
-        if (!found) loadExtractor(url, referer, subtitleCallback, callback)
+        } catch (e: Exception) {
+            Log.d(TAG, "blogger failed: $e")
+        }
+        if (!found) {
+            Log.d(TAG, "blogger: no stream URL in the page, trying the built-in extractor")
+            loadExtractor(url, referer, subtitleCallback, callback)
+        }
     }
 
     /**
@@ -319,16 +356,20 @@ class Oploverz : MainAPI() {
             val code = url.substringBefore("?").trimEnd('/').substringAfterLast("/")
                 .removeSuffix(".html").substringAfterLast("-")
             if (code.isBlank()) return
-            val page = app.post(
+            val resp = app.post(
                 "$host/dl",
                 headers = mapOf("User-Agent" to BROWSER_UA, "Origin" to host),
                 referer = url,
                 data = mapOf("op" to "embed", "file_code" to code, "auto" to "1", "referer" to (referer ?: ""))
-            ).text
+            )
+            val page = resp.text
             val stream = listOfNotNull(getPacked(page), page)
                 .firstNotNullOfOrNull { JW_SOURCE.find(it)?.groupValues?.get(1) }
                 ?.let { if (it.startsWith("//")) "https:$it" else it }
-                ?: return
+            if (stream == null) {
+                Log.d(TAG, "upbolt $code: no source in /dl answer (${resp.code}, ${page.length} chars)")
+                return
+            }
             callback(
                 newExtractorLink(
                     "Upbolt", "Upbolt", stream,
@@ -338,6 +379,8 @@ class Oploverz : MainAPI() {
                     this.headers = mapOf("User-Agent" to BROWSER_UA)
                 }
             )
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            Log.d(TAG, "upbolt failed: $e")
+        }
     }
 }
