@@ -1,6 +1,7 @@
 package com.indo
 
 import android.util.Log
+import android.webkit.CookieManager
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
@@ -178,6 +179,9 @@ class Hanime : MainAPI() {
         val linkHeaders = mutableMapOf<String, String>()
         (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
         request.header("Origin")?.let { linkHeaders["Origin"] = it }
+        // The playlist may be tied to the page's session; carry the WebView's cookies for it.
+        runCatching { CookieManager.getInstance().getCookie(streamUrl) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }?.let { linkHeaders["Cookie"] = it }
         val referer = request.header("Referer") ?: "$mainUrl/"
         Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath}")
         callback(newExtractorLink(name, "$name HLS", streamUrl, type = ExtractorLinkType.M3U8) {
@@ -203,7 +207,8 @@ class Hanime : MainAPI() {
         private const val TAG = "Hanime"
         private const val PAGE_SIZE = 24
 
-        private val STREAM_URL_REGEX = Regex("""\.m3u8(\?|$)""")
+        // The player's HLS playlist is served as hanime.tv/hls/<id>/<token>, without an extension.
+        private val STREAM_URL_REGEX = Regex("""\.m3u8(\?|$)|hanime\.tv/hls/""")
 
         // Requests logged while the WebView runs, to see how far the player got.
         private val TRACE_URL_REGEX = Regex("""hanime\.tv/|freeanimehentai\.net/|/manifest|challenges\.cloudflare\.com/""")
