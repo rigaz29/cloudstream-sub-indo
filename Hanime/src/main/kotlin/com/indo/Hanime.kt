@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
 class Hanime : MainAPI() {
@@ -28,22 +29,68 @@ class Hanime : MainAPI() {
         "Origin" to "$mainUrl/"
     )
 
-    // The landing endpoint answers 403 (Cloudflare block page), so the home page is built from
-    // the catalog, sorted by the key in each request's data.
     override val mainPage = mainPageOf(
-        "created_at_unix" to "Recent Uploads",
-        "released_at_unix" to "New Releases",
-        "views" to "Most Viewed",
-        "likes" to "Most Liked"
+        "$mainUrl/" to "Home"
     )
 
+    /**
+     * The same rows as the site's home page (Recent Uploads, New Releases, Trending, Random,
+     * 24 each). The page is rendered on the server: each row starts with a header island whose
+     * props hold the row title (and an all_href), followed by the video cards. The landing API
+     * answers 403 (Cloudflare block page), so if the page cannot be read, fall back to rows
+     * built from the catalog.
+     */
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val catalog = getSearchCatalog()
-        if (catalog.isNullOrEmpty()) return newHomePageResponse(request.name, emptyList())
-        val sorted = catalog.sortedByDescending { (it[request.data] as? Number)?.toLong() ?: 0L }
-        val from = (page - 1).coerceAtLeast(0) * PAGE_SIZE
-        val items = sorted.drop(from).take(PAGE_SIZE).mapNotNull { toSearchResponse(it) }
-        return newHomePageResponse(request.name, items, hasNext = from + PAGE_SIZE < sorted.size)
+        if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), hasNext = false)
+        val catalog = getSearchCatalog().orEmpty()
+        val bySlug = catalog.associateBy { it["slug"]?.toString() }
+
+        val rows = try {
+            val doc = app.get("$mainUrl/", headers = headers).document
+            val rows = mutableListOf<Pair<String, MutableList<SearchResponse>>>()
+            doc.select("astro-island[props*=all_href], a[href^=/videos/hentai/]").forEach { el ->
+                if (el.tagName() == "astro-island") {
+                    val title = tryParseJson<Map<String, Any?>>(el.attr("props"))
+                        ?.get("title")?.let { (it as? List<*>)?.getOrNull(1)?.toString() }
+                    if (!title.isNullOrBlank()) rows.add(title to mutableListOf())
+                } else {
+                    val row = rows.lastOrNull() ?: return@forEach
+                    val slug = el.attr("href").removePrefix("/videos/hentai/").substringBefore("?").trimEnd('/')
+                    if (slug.isBlank() || row.second.any { it.url.endsWith("/$slug") }) return@forEach
+                    val item = toSearchResponse(bySlug[slug]) ?: cardToSearchResponse(el, slug)
+                    if (item != null) row.second.add(item)
+                }
+            }
+            rows.filter { it.second.isNotEmpty() }.map { HomePageList(it.first, it.second) }
+        } catch (e: Exception) {
+            Log.d(TAG, "home page failed: $e")
+            emptyList()
+        }
+        Log.d(TAG, "home rows: ${rows.map { "${it.name}=${it.list.size}" }}")
+        if (rows.isNotEmpty()) return newHomePageResponse(rows, hasNext = false)
+
+        val fallback = listOf(
+            "created_at_unix" to "Recent Uploads",
+            "released_at_unix" to "New Releases",
+            "views" to "Most Viewed",
+            "likes" to "Most Liked"
+        ).map { (key, title) ->
+            HomePageList(title, catalog.sortedByDescending { (it[key] as? Number)?.toLong() ?: 0L }
+                .take(PAGE_SIZE).mapNotNull { toSearchResponse(it) })
+        }.filter { it.list.isNotEmpty() }
+        return newHomePageResponse(fallback, hasNext = false)
+    }
+
+    private fun cardToSearchResponse(card: org.jsoup.nodes.Element, slug: String): SearchResponse? {
+        val img = card.selectFirst("img")
+        val title = img?.attr("alt")?.ifBlank { null }
+            ?: card.attr("title").removePrefix("Watch ").substringBefore(" hentai stream").ifBlank { null }
+            ?: return null
+        val poster = img?.attr("src")?.ifBlank { null } ?: "https://hanime-cdn.com/images/posters/$slug-pv1.webp"
+        return newMovieSearchResponse(title, "$mainUrl/videos/hentai/$slug", TvType.NSFW) {
+            this.posterUrl = poster
+            this.posterHeaders = mapOf("Referer" to "$mainUrl/")
+        }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
@@ -141,10 +188,12 @@ class Hanime : MainAPI() {
         val slug = data.trimEnd('/').substringAfterLast("/")
         val pageUrl = "$mainUrl/videos/hentai/$slug"
         var lastState = ""
+        // Stream entries the page script copied from the player's handshake/manifest answers.
+        val captured = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Int?>>())
         val request = try {
             val resolver = WebViewResolver(
                 interceptUrl = STREAM_URL_REGEX,
-                additionalUrls = listOf(TRACE_URL_REGEX),
+                additionalUrls = listOf(TRACE_URL_REGEX, STREAMS_URL_REGEX),
                 userAgent = null,
                 useOkhttp = false,
                 script = AUTOPLAY_JS,
@@ -163,7 +212,11 @@ class Hanime : MainAPI() {
                 headers = emptyMap(),
                 method = "GET"
             ) { req ->
-                Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
+                if (req.url.encodedPath == STREAMS_PATH) {
+                    readStreamsReport(req.url.queryParameter("d"), captured)
+                } else {
+                    Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
+                }
                 false
             }.first
         } catch (e: Exception) {
@@ -177,18 +230,37 @@ class Hanime : MainAPI() {
 
         val streamUrl = request.url.toString()
         val linkHeaders = mutableMapOf<String, String>()
+        val streams = synchronized(captured) { captured.toList() }.distinctBy { it.first }
         (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
         request.header("Origin")?.let { linkHeaders["Origin"] = it }
         // The playlist may be tied to the page's session; carry the WebView's cookies for it.
         runCatching { CookieManager.getInstance().getCookie(streamUrl) }.getOrNull()
             ?.takeIf { it.isNotBlank() }?.let { linkHeaders["Cookie"] = it }
         val referer = request.header("Referer") ?: "$mainUrl/"
-        Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath}")
-        callback(newExtractorLink(name, "$name HLS", streamUrl, type = ExtractorLinkType.M3U8) {
-            this.referer = referer
-            this.headers = linkHeaders
-        })
+        Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath.take(16)}..., ${streams.size} stream(s) from the handshake")
+
+        // Every quality the player was offered, or else the one playlist it opened.
+        val links = streams.filter { it.first.startsWith("http") }.ifEmpty { listOf(streamUrl to null) }
+        links.forEach { (url, height) ->
+            callback(newExtractorLink(name, if (height != null) "$name ${height}p" else "$name HLS", url, type = ExtractorLinkType.M3U8) {
+                this.referer = referer
+                this.headers = linkHeaders
+                this.quality = height ?: Qualities.Unknown.value
+            })
+        }
         return true
+    }
+
+    private fun readStreamsReport(data: String?, into: MutableList<Pair<String, Int?>>) {
+        val report = data?.let { tryParseJson<Map<String, Any?>>(it) } ?: return
+        Log.d(TAG, "player answer ${report["src"]}: shape ${report["shape"].toString().take(1500)}")
+        (report["streams"] as? List<*>)?.forEach { entry ->
+            val e = entry as? Map<*, *> ?: return@forEach
+            val url = e["url"]?.toString()?.ifBlank { null } ?: return@forEach
+            val height = e["height"]?.toString()?.filter { it.isDigit() }?.toIntOrNull()
+            Log.d(TAG, "player stream: height=$height label=${e["label"]} ${url.substringBefore("?").take(60)}")
+            into.add(url to height)
+        }
     }
 
     private fun toSearchResponse(video: Map<String, Any?>?): SearchResponse? {
@@ -210,6 +282,10 @@ class Hanime : MainAPI() {
         // The player's HLS playlist is served as hanime.tv/hls/<id>/<token>, without an extension.
         private val STREAM_URL_REGEX = Regex("""\.m3u8(\?|$)|hanime\.tv/hls/""")
 
+        // Request the page script makes to hand over what the player's handshake answered.
+        private const val STREAMS_PATH = "/__cs_streams.png"
+        private val STREAMS_URL_REGEX = Regex("""/__cs_streams\.png\?""")
+
         // Requests logged while the WebView runs, to see how far the player got.
         private val TRACE_URL_REGEX = Regex("""hanime\.tv/|freeanimehentai\.net/|/manifest|challenges\.cloudflare\.com/""")
 
@@ -222,6 +298,61 @@ class Hanime : MainAPI() {
         // Returns a short state string for the log.
         private const val AUTOPLAY_JS = """
             (function () {
+                // Copy what the site's player receives from its handshake/manifest calls: a shape of
+                // the JSON (keys and types only) and any stream entries (url with /hls/ or .m3u8,
+                // plus height). Handed over in a request to STREAMS_PATH that the resolver answers
+                // locally; fetch callers only get the response after that request has gone out.
+                function shape(o, d) {
+                    if (o === null || typeof o !== 'object') return typeof o;
+                    if (d > 3) return Array.isArray(o) ? 'array' : 'object';
+                    if (Array.isArray(o)) return [o.length ? shape(o[0], d + 1) : 'empty', o.length];
+                    var r = {};
+                    Object.keys(o).slice(0, 30).forEach(function (k) { r[k] = shape(o[k], d + 1); });
+                    return r;
+                }
+                function streams(o, out) {
+                    if (!o || typeof o !== 'object') return out;
+                    if (Array.isArray(o)) { o.forEach(function (x) { streams(x, out); }); return out; }
+                    if (typeof o.url === 'string' && /\/hls\/|\.m3u8/.test(o.url)) {
+                        out.push({ url: o.url, height: o.height || o.resolution || o.quality || null,
+                                   label: o.label || o.kind || o.server || null });
+                    }
+                    Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === 'object') streams(o[k], out); });
+                    return out;
+                }
+                function report(src, j) {
+                    var info = { src: src, shape: shape(j, 0), streams: streams(j, []) };
+                    new Image().src = location.origin + '/__cs_streams.png?d=' + encodeURIComponent(JSON.stringify(info));
+                }
+                var watched = /handshake|manifest/;
+                if (!window.__csHanimeHook) {
+                    window.__csHanimeHook = true;
+                    if (window.fetch) {
+                        var origFetch = window.fetch;
+                        window.fetch = function (input) {
+                            var url = typeof input === 'string' ? input : (input && input.url) || String(input);
+                            var p = origFetch.apply(this, arguments);
+                            if (!watched.test(url)) return p;
+                            return p.then(function (res) {
+                                return res.clone().json().then(function (j) {
+                                    report(url.split('?')[0], j);
+                                    return res;
+                                }, function () { return res; });
+                            });
+                        };
+                    }
+                    var xo = XMLHttpRequest.prototype.open, xs = XMLHttpRequest.prototype.send;
+                    XMLHttpRequest.prototype.open = function (m, u) { this.__csUrl = String(u || ''); return xo.apply(this, arguments); };
+                    XMLHttpRequest.prototype.send = function () {
+                        var x = this;
+                        if (watched.test(x.__csUrl || '')) {
+                            x.addEventListener('load', function () {
+                                try { report(x.__csUrl.split('?')[0], JSON.parse(x.responseText)); } catch (e) {}
+                            });
+                        }
+                        return xs.apply(this, arguments);
+                    };
+                }
                 function tick() {
                     document.querySelectorAll('astro-island[client="visible"]').forEach(function (el) {
                         if (el.__csStarted || typeof el.start !== 'function') return;
