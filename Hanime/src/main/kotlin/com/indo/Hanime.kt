@@ -1,11 +1,12 @@
 package com.indo
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
-import com.lagradost.cloudstream3.utils.M3u8Helper
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import com.lagradost.nicehttp.JsonAsString
 
 class Hanime : MainAPI() {
     override var mainUrl = "https://hanime.tv"
@@ -26,105 +27,84 @@ class Hanime : MainAPI() {
         "Origin" to "$mainUrl/"
     )
 
-    private val playerHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        "Referer" to "https://player.hanime.tv/",
-        "Origin" to "https://player.hanime.tv/"
-    )
-
+    // The landing endpoint answers 403 (Cloudflare block page), so the home page is built from
+    // the catalog, sorted by the key in each request's data.
     override val mainPage = mainPageOf(
-        "$apiBase/landing" to "Recent Uploads"
+        "created_at_unix" to "Recent Uploads",
+        "released_at_unix" to "New Releases",
+        "views" to "Most Viewed",
+        "likes" to "Most Liked"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(emptyList())
-
-        val json = try {
-            app.get(request.data, headers = headers).text
-        } catch (_: Exception) { null }
-
-        val root = tryParseJson<Map<String, Any?>>(json ?: return newHomePageResponse(emptyList()))
-        if (root != null) {
-            val sections = root["sections"] as? List<Map<String, Any?>> ?: emptyList()
-            val videosMap = (root["hentai_videos"] as? List<Map<String, Any?>>)
-                ?.associateBy { it["id"] } ?: emptyMap()
-            val response = sections.mapNotNull { section ->
-                val title = section["title"]?.toString() ?: return@mapNotNull null
-                val ids = section["hentai_video_ids"] as? List<*> ?: return@mapNotNull null
-                HomePageList(title, ids.mapNotNull { id -> toSearchResponse(videosMap[id]) })
-            }
-            if (response.isNotEmpty()) return newHomePageResponse(response)
-        }
-
         val catalog = getSearchCatalog()
-        if (catalog.isNullOrEmpty()) return newHomePageResponse(emptyList())
-
-        val items = catalog.asReversed().take(25).mapNotNull { toSearchResponse(it) }
-        return newHomePageResponse(listOf(HomePageList("Recent Uploads", items)))
+        if (catalog.isNullOrEmpty()) return newHomePageResponse(request.name, emptyList())
+        val sorted = catalog.sortedByDescending { (it[request.data] as? Number)?.toLong() ?: 0L }
+        val from = (page - 1).coerceAtLeast(0) * PAGE_SIZE
+        val items = sorted.drop(from).take(PAGE_SIZE).mapNotNull { toSearchResponse(it) }
+        return newHomePageResponse(request.name, items, hasNext = from + PAGE_SIZE < sorted.size)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         if (query.isBlank()) return listOf()
-
-        val catalog = getSearchCatalog()
-        if (!catalog.isNullOrEmpty()) {
-            val q = query.lowercase()
-            return catalog.asSequence()
-                .filter { item ->
-                    item["name"]?.toString()?.lowercase()?.contains(q) == true ||
-                        item["search_titles"]?.toString()?.lowercase()?.contains(q) == true ||
-                        item["slug"]?.toString()?.lowercase()?.contains(q) == true
-                }
-                .mapNotNull { toSearchResponse(it) }
-                .take(50)
-                .toList()
-        }
-
-        val doc = app.get("$mainUrl/browse?search=$query", headers = headers).document
-        return doc.select("div.hvc.item.card a[href^=/videos/hentai/]").mapNotNull { a ->
-            val slug = a.attr("href").removePrefix("/videos/hentai/").ifBlank { null } ?: return@mapNotNull null
-            val title = a.attr("alt").ifBlank { return@mapNotNull null }
-            newMovieSearchResponse(title, "$mainUrl/videos/hentai/$slug", TvType.NSFW) {
-                this.posterUrl = "https://hanime-cdn.com/images/posters/$slug-pv1.webp"
-                this.posterHeaders = mapOf("Referer" to "$mainUrl/")
+        val catalog = getSearchCatalog() ?: return listOf()
+        val q = query.lowercase()
+        return catalog.asSequence()
+            .filter { item ->
+                item["name"]?.toString()?.lowercase()?.contains(q) == true ||
+                    item["search_titles"]?.toString()?.lowercase()?.contains(q) == true ||
+                    item["slug"]?.toString()?.lowercase()?.contains(q) == true
             }
-        }.distinctBy { it.url }
+            .mapNotNull { toSearchResponse(it) }
+            .take(50)
+            .toList()
     }
 
+    /**
+     * The whole catalog (a few thousand videos, ~4.5 MB) from search_hvs, cached for an hour.
+     * It used to be a bare list; it is now {"data": [...], "ads": {...}}. Both shapes are read.
+     */
+    @Suppress("UNCHECKED_CAST")
     private suspend fun getSearchCatalog(): List<Map<String, Any?>>? {
         val now = System.currentTimeMillis()
         if (searchCatalog != null && now - searchCatalogTime < 3_600_000L) return searchCatalog
-        searchCatalog = try {
-            app.get("$apiBase/search_hvs", headers = headers).text
-                ?.let { tryParseJson<List<Map<String, Any?>>>(it) }
-        } catch (_: Exception) {
+        val text = try {
+            app.get("$apiBase/search_hvs", headers = headers, timeout = 60L).text
+        } catch (e: Exception) {
+            Log.d(TAG, "catalog request failed: $e")
             null
         }
-        searchCatalogTime = now
-        return searchCatalog
+        val parsed = text?.let { body ->
+            tryParseJson<Map<String, Any?>>(body)?.get("data") as? List<Map<String, Any?>>
+                ?: tryParseJson<List<Map<String, Any?>>>(body)
+        }
+        Log.d(TAG, "catalog: ${parsed?.size ?: "unreadable"} videos")
+        if (parsed != null) {
+            searchCatalog = parsed
+            searchCatalogTime = now
+        }
+        return parsed ?: searchCatalog
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val slug = url.substringAfterLast("/")
-
-        val detail = try {
-            val text = app.get("$apiBase/video?id=$slug", headers = headers).text
-            val root = text?.let { tryParseJson<Map<String, Any?>>(it) }
-            root?.get("hentai_video") as? Map<*, *>
-        } catch (_: Exception) { null }
-
-        if (detail != null) return buildMovieResponse(detail, url)
+        val slug = url.trimEnd('/').substringAfterLast("/")
 
         val fromCatalog = getSearchCatalog()?.firstOrNull { it["slug"]?.toString() == slug }
         if (fromCatalog != null) return buildMovieResponse(fromCatalog, url)
+
+        val detail = try {
+            val text = app.get("$apiBase/video?id=$slug", headers = headers).text
+            tryParseJson<Map<String, Any?>>(text)?.get("hentai_video") as? Map<*, *>
+        } catch (_: Exception) { null }
+        if (detail != null) return buildMovieResponse(detail, url)
 
         throw ErrorLoadingException("Video not found")
     }
 
     private suspend fun buildMovieResponse(video: Map<*, *>, url: String): LoadResponse {
         val title = video["name"]?.toString() ?: throw ErrorLoadingException("Title not found")
-        val plot = (video["description"]?.toString() ?: "").replace(Regex("<[^>]*>"), "").ifBlank { null }
-        val poster = video["poster_url"]?.toString()
+        val plot = (video["description"]?.toString() ?: "").replace(Regex("<[^>]*>"), "").trim().ifBlank { null }
+        val poster = video["poster_url"]?.toString()?.ifBlank { null }
             ?: video["cover_url"]?.toString()?.replace("covers", "posters")?.replace("cv1", "pv1")
         val tags = when (val t = video["hentai_tags"] ?: video["tags"]) {
             is List<*> -> if (t.firstOrNull() is String) {
@@ -145,71 +125,65 @@ class Hanime : MainAPI() {
         }
     }
 
+    /**
+     * The stream manifest endpoint only answers requests signed by the site's own web player
+     * (x-signature-version/x-signature/x-time). Instead of making such requests, open the video
+     * page in a WebView and let the site's player load the stream, then take the HLS request it
+     * makes. Requests and a short page state are logged under the Hanime tag.
+     */
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val slug = data.substringAfterLast("/")
-
-        val hvId = try {
-            val text = app.get("$apiBase/video?id=$slug", headers = headers).text
-            val root = text?.let { tryParseJson<Map<String, Any?>>(it) }
-            (root?.get("hentai_video") as? Map<*, *>)?.get("id")?.toString()
-        } catch (_: Exception) { null }
-
-        val resolvedId = hvId
-            ?: getSearchCatalog()?.firstOrNull { it["slug"]?.toString() == slug }?.get("id")?.toString()
-            ?: return false
-
-        try {
-            app.post("$apiBase/hentai_videos/$slug/play", headers = headers, json = JsonAsString("{}"))
-        } catch (_: Exception) { }
-
-        val manifestHeaders = mapOf(
-            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-            "Referer" to "$mainUrl/",
-            "Origin" to "$mainUrl",
-            "Accept" to "application/json",
-            "x-signature-version" to "web2",
-            "x-signature" to "",
-            "x-time" to "0",
-            "x-session-token" to "",
-            "x-csrf-token" to ""
-        )
-
-        val manifestJson = try {
-            app.get("$apiBase/guest/videos/$resolvedId/manifest", headers = manifestHeaders).text
-        } catch (_: Exception) { null }
-
-        val hlsUrl = if (!manifestJson.isNullOrBlank()) {
-            val manifestRoot = tryParseJson<Map<String, Any?>>(manifestJson)
-            if (manifestRoot != null) {
-                manifestRoot["url"]?.toString()
-                    ?: (manifestRoot["videos_manifest"] as? Map<*, *>)
-                        ?.let { m -> (m["servers"] as? List<Map<*, *>>)?.firstOrNull()
-                            ?.let { s -> (s["streams"] as? List<Map<*, *>>)?.firstOrNull()
-                                ?.let { st -> st["url"]?.toString() } } }
-            } else null
-        } else null
-
-        if (hlsUrl.isNullOrBlank()) return false
-
-        val links = M3u8Helper.generateM3u8(
-            source = name,
-            streamUrl = hlsUrl,
-            referer = "https://player.hanime.tv/",
-            headers = playerHeaders
-        )
-        if (links.isEmpty()) {
-            callback(newExtractorLink(name, "$name - HLS", hlsUrl) {
-                this.referer = "https://player.hanime.tv/"
-            })
-        } else {
-            links.forEach { callback(it) }
+        val slug = data.trimEnd('/').substringAfterLast("/")
+        val pageUrl = "$mainUrl/videos/hentai/$slug"
+        var lastState = ""
+        val request = try {
+            val resolver = WebViewResolver(
+                interceptUrl = STREAM_URL_REGEX,
+                additionalUrls = listOf(TRACE_URL_REGEX),
+                userAgent = null,
+                useOkhttp = false,
+                script = AUTOPLAY_JS,
+                scriptCallback = { state ->
+                    if (state != lastState) {
+                        lastState = state
+                        Log.d(TAG, "page state: $state")
+                    }
+                },
+                timeout = 60_000L
+            )
+            Log.d(TAG, "webview start")
+            resolver.resolveUsingWebView(
+                url = pageUrl,
+                referer = "$mainUrl/",
+                headers = emptyMap(),
+                method = "GET"
+            ) { req ->
+                Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
+                false
+            }.first
+        } catch (e: Exception) {
+            Log.d(TAG, "webview failed: $e")
+            null
+        }
+        if (request == null) {
+            Log.d(TAG, "webview gave no stream, last page state: $lastState")
+            return false
         }
 
+        val streamUrl = request.url.toString()
+        val linkHeaders = mutableMapOf<String, String>()
+        (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
+        request.header("Origin")?.let { linkHeaders["Origin"] = it }
+        val referer = request.header("Referer") ?: "$mainUrl/"
+        Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath}")
+        callback(newExtractorLink(name, "$name HLS", streamUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = referer
+            this.headers = linkHeaders
+        })
         return true
     }
 
@@ -223,5 +197,38 @@ class Hanime : MainAPI() {
             this.posterUrl = poster
             this.posterHeaders = mapOf("Referer" to "$mainUrl/")
         }
+    }
+
+    companion object {
+        private const val TAG = "Hanime"
+        private const val PAGE_SIZE = 24
+
+        private val STREAM_URL_REGEX = Regex("""\.m3u8(\?|$)""")
+
+        // Requests logged while the WebView runs, to see how far the player got.
+        private val TRACE_URL_REGEX = Regex("""hanime\.tv/|freeanimehentai\.net/|/manifest|challenges\.cloudflare\.com/""")
+
+        // Presses common play buttons and starts any <video> in the page (muted), once a second.
+        // Returns a short state string for the log: frames, videos and a Cloudflare page flag.
+        private const val AUTOPLAY_JS = """
+            (function () {
+                if (!window.__csHanime) {
+                    window.__csHanime = true;
+                    setInterval(function () {
+                        ['.play-btn', '.vjs-big-play-button', 'button[aria-label="Play"]', '.plyr__control--overlaid',
+                         '.jw-display-icon-container', '[class*="play-button"]', '[class*="PlayButton"]'].forEach(function (s) {
+                            var b = document.querySelector(s);
+                            if (b) b.click();
+                        });
+                        document.querySelectorAll('video').forEach(function (v) {
+                            if (v.paused) { v.muted = true; var p = v.play && v.play(); if (p && p.catch) p.catch(function () {}); }
+                        });
+                    }, 1000);
+                }
+                var cf = /attention required|just a moment/i.test(document.title || '');
+                return 'ready=' + document.readyState + ' iframes=' + document.querySelectorAll('iframe').length
+                    + ' videos=' + document.querySelectorAll('video').length + (cf ? ' cloudflare' : '');
+            })();
+        """
     }
 }
