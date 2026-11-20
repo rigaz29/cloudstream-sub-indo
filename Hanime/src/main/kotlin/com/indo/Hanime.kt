@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 
@@ -188,12 +189,10 @@ class Hanime : MainAPI() {
         val slug = data.trimEnd('/').substringAfterLast("/")
         val pageUrl = "$mainUrl/videos/hentai/$slug"
         var lastState = ""
-        // Stream entries the page script copied from the player's handshake/manifest answers.
-        val captured = java.util.Collections.synchronizedList(mutableListOf<Pair<String, Int?>>())
         val request = try {
             val resolver = WebViewResolver(
                 interceptUrl = STREAM_URL_REGEX,
-                additionalUrls = listOf(TRACE_URL_REGEX, STREAMS_URL_REGEX),
+                additionalUrls = listOf(TRACE_URL_REGEX),
                 userAgent = null,
                 useOkhttp = false,
                 script = AUTOPLAY_JS,
@@ -212,11 +211,7 @@ class Hanime : MainAPI() {
                 headers = emptyMap(),
                 method = "GET"
             ) { req ->
-                if (req.url.encodedPath == STREAMS_PATH) {
-                    readStreamsReport(req.url.queryParameter("d"), captured)
-                } else {
-                    Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
-                }
+                Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath}")
                 false
             }.first
         } catch (e: Exception) {
@@ -230,37 +225,38 @@ class Hanime : MainAPI() {
 
         val streamUrl = request.url.toString()
         val linkHeaders = mutableMapOf<String, String>()
-        val streams = synchronized(captured) { captured.toList() }.distinctBy { it.first }
         (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
         request.header("Origin")?.let { linkHeaders["Origin"] = it }
         // The playlist may be tied to the page's session; carry the WebView's cookies for it.
         runCatching { CookieManager.getInstance().getCookie(streamUrl) }.getOrNull()
             ?.takeIf { it.isNotBlank() }?.let { linkHeaders["Cookie"] = it }
         val referer = request.header("Referer") ?: "$mainUrl/"
-        Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath.take(16)}..., ${streams.size} stream(s) from the handshake")
+        Log.d(TAG, "stream: ${request.url.host}${request.url.encodedPath.take(16)}...")
 
-        // Every quality the player was offered, or else the one playlist it opened.
-        val links = streams.filter { it.first.startsWith("http") }.ifEmpty { listOf(streamUrl to null) }
-        links.forEach { (url, height) ->
-            callback(newExtractorLink(name, if (height != null) "$name ${height}p" else "$name HLS", url, type = ExtractorLinkType.M3U8) {
-                this.referer = referer
-                this.headers = linkHeaders
-                this.quality = height ?: Qualities.Unknown.value
-            })
+        // The playlist is a master; the site's player builds its quality menu from its
+        // EXT-X-STREAM-INF lines (and adds a "1080p" premium promotion when that variant is
+        // missing). Emit the master as "Auto", and one link per variant when there are several.
+        val playlistHeaders = linkHeaders + ("Referer" to referer)
+        val heights = try {
+            val text = app.get(streamUrl, headers = playlistHeaders).text
+            STREAM_INF_HEIGHT.findAll(text).map { it.groupValues[1].toInt() }.toList()
+        } catch (e: Exception) {
+            Log.d(TAG, "playlist check failed: $e")
+            emptyList()
+        }
+        Log.d(TAG, "playlist variants: $heights")
+        callback(newExtractorLink(name, "$name Auto", streamUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = referer
+            this.headers = linkHeaders
+            this.quality = heights.maxOrNull() ?: Qualities.Unknown.value
+        })
+        if (heights.size >= 2) {
+            runCatching { M3u8Helper.generateM3u8(name, streamUrl, referer, headers = playlistHeaders) }
+                .getOrDefault(emptyList())
+                .filter { it.url != streamUrl }
+                .forEach { callback(it) }
         }
         return true
-    }
-
-    private fun readStreamsReport(data: String?, into: MutableList<Pair<String, Int?>>) {
-        val report = data?.let { tryParseJson<Map<String, Any?>>(it) } ?: return
-        Log.d(TAG, "player answer ${report["src"]}: shape ${report["shape"].toString().take(1500)}")
-        (report["streams"] as? List<*>)?.forEach { entry ->
-            val e = entry as? Map<*, *> ?: return@forEach
-            val url = e["url"]?.toString()?.ifBlank { null } ?: return@forEach
-            val height = e["height"]?.toString()?.filter { it.isDigit() }?.toIntOrNull()
-            Log.d(TAG, "player stream: height=$height label=${e["label"]} ${url.substringBefore("?").take(60)}")
-            into.add(url to height)
-        }
     }
 
     private fun toSearchResponse(video: Map<String, Any?>?): SearchResponse? {
@@ -282,9 +278,8 @@ class Hanime : MainAPI() {
         // The player's HLS playlist is served as hanime.tv/hls/<id>/<token>, without an extension.
         private val STREAM_URL_REGEX = Regex("""\.m3u8(\?|$)|hanime\.tv/hls/""")
 
-        // Request the page script makes to hand over what the player's handshake answered.
-        private const val STREAMS_PATH = "/__cs_streams.png"
-        private val STREAMS_URL_REGEX = Regex("""/__cs_streams\.png\?""")
+        // Height of each variant in a master playlist.
+        private val STREAM_INF_HEIGHT = Regex("""#EXT-X-STREAM-INF:[^\n]*RESOLUTION=\d+x(\d+)""")
 
         // Requests logged while the WebView runs, to see how far the player got.
         private val TRACE_URL_REGEX = Regex("""hanime\.tv/|freeanimehentai\.net/|/manifest|challenges\.cloudflare\.com/""")
@@ -298,61 +293,6 @@ class Hanime : MainAPI() {
         // Returns a short state string for the log.
         private const val AUTOPLAY_JS = """
             (function () {
-                // Copy what the site's player receives from its handshake/manifest calls: a shape of
-                // the JSON (keys and types only) and any stream entries (url with /hls/ or .m3u8,
-                // plus height). Handed over in a request to STREAMS_PATH that the resolver answers
-                // locally; fetch callers only get the response after that request has gone out.
-                function shape(o, d) {
-                    if (o === null || typeof o !== 'object') return typeof o;
-                    if (d > 3) return Array.isArray(o) ? 'array' : 'object';
-                    if (Array.isArray(o)) return [o.length ? shape(o[0], d + 1) : 'empty', o.length];
-                    var r = {};
-                    Object.keys(o).slice(0, 30).forEach(function (k) { r[k] = shape(o[k], d + 1); });
-                    return r;
-                }
-                function streams(o, out) {
-                    if (!o || typeof o !== 'object') return out;
-                    if (Array.isArray(o)) { o.forEach(function (x) { streams(x, out); }); return out; }
-                    if (typeof o.url === 'string' && /\/hls\/|\.m3u8/.test(o.url)) {
-                        out.push({ url: o.url, height: o.height || o.resolution || o.quality || null,
-                                   label: o.label || o.kind || o.server || null });
-                    }
-                    Object.keys(o).forEach(function (k) { if (o[k] && typeof o[k] === 'object') streams(o[k], out); });
-                    return out;
-                }
-                function report(src, j) {
-                    var info = { src: src, shape: shape(j, 0), streams: streams(j, []) };
-                    new Image().src = location.origin + '/__cs_streams.png?d=' + encodeURIComponent(JSON.stringify(info));
-                }
-                var watched = /handshake|manifest/;
-                if (!window.__csHanimeHook) {
-                    window.__csHanimeHook = true;
-                    if (window.fetch) {
-                        var origFetch = window.fetch;
-                        window.fetch = function (input) {
-                            var url = typeof input === 'string' ? input : (input && input.url) || String(input);
-                            var p = origFetch.apply(this, arguments);
-                            if (!watched.test(url)) return p;
-                            return p.then(function (res) {
-                                return res.clone().json().then(function (j) {
-                                    report(url.split('?')[0], j);
-                                    return res;
-                                }, function () { return res; });
-                            });
-                        };
-                    }
-                    var xo = XMLHttpRequest.prototype.open, xs = XMLHttpRequest.prototype.send;
-                    XMLHttpRequest.prototype.open = function (m, u) { this.__csUrl = String(u || ''); return xo.apply(this, arguments); };
-                    XMLHttpRequest.prototype.send = function () {
-                        var x = this;
-                        if (watched.test(x.__csUrl || '')) {
-                            x.addEventListener('load', function () {
-                                try { report(x.__csUrl.split('?')[0], JSON.parse(x.responseText)); } catch (e) {}
-                            });
-                        }
-                        return xs.apply(this, arguments);
-                    };
-                }
                 function tick() {
                     document.querySelectorAll('astro-island[client="visible"]').forEach(function (el) {
                         if (el.__csStarted || typeof el.start !== 'function') return;
