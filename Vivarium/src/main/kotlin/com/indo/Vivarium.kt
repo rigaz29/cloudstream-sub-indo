@@ -1,17 +1,27 @@
 package com.indo
 
+import android.content.Context
 import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import com.lagradost.api.getContext
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.metaproviders.TmdbLink
 import com.lagradost.cloudstream3.metaproviders.TmdbProvider
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * vivarium.st. The catalog (home, search, details, seasons and episodes) comes from TMDB through
@@ -47,44 +57,18 @@ class Vivarium : TmdbProvider() {
             "$mainUrl/m/$id?w=1"
         }
 
-        var lastState = ""
-        val request = try {
-            Log.d(TAG, "webview start: $pageUrl")
-            WebViewResolver(
-                interceptUrl = MASTER_URL,
-                additionalUrls = listOf(TRACE_URL),
-                userAgent = null,
-                useOkhttp = false,
-                script = PICK_SOURCE_JS,
-                scriptCallback = { state ->
-                    if (state != lastState) {
-                        lastState = state
-                        Log.d(TAG, "page state: $state")
-                    }
-                },
-                timeout = 90_000L
-            ).resolveUsingWebView(
-                url = pageUrl,
-                referer = "$mainUrl/",
-                headers = emptyMap(),
-                method = "GET"
-            ) { req ->
-                Log.d(TAG, "webview request: ${req.method} ${req.url.host}${req.url.encodedPath.take(40)}")
-                false
-            }.first
+        val caught = try {
+            catchMaster(pageUrl)
         } catch (e: Exception) {
             Log.d(TAG, "webview failed: $e")
             null
         }
-        if (request == null) {
-            Log.d(TAG, "no master playlist, last page state: $lastState")
-            return false
-        }
+        if (caught == null) return false
 
-        val streamUrl = request.url.toString()
-        Log.d(TAG, "stream: ${request.url.host}")
+        val streamUrl = caught.url
         val linkHeaders = mutableMapOf("Origin" to mainUrl)
-        (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
+        val userAgent = caught.headers.entries.firstOrNull { it.key.equals("User-Agent", true) }?.value
+        userAgent?.let { linkHeaders["User-Agent"] = it }
         runCatching { CookieManager.getInstance().getCookie(streamUrl) }.getOrNull()
             ?.takeIf { it.isNotBlank() }?.let { linkHeaders["Cookie"] = it }
         callback(newExtractorLink(name, "$name HLS", streamUrl, type = ExtractorLinkType.M3U8) {
@@ -95,6 +79,69 @@ class Vivarium : TmdbProvider() {
         return true
     }
 
+    private class Caught(val url: String, val headers: Map<String, String>)
+
+    /**
+     * Opens [pageUrl] in a WebView of our own and waits for the player to request a master playlist.
+     * CloudStream's WebViewResolver answers .css requests with an empty body, and the site then never
+     * starts its app (reproduced in a desktop browser: blanking only the CSS stops it before
+     * /api/gate). So no request is touched here; the page loads as in a browser, the source-picking
+     * script is run every 2 s, and the first MASTER_URL request is taken.
+     */
+    private suspend fun catchMaster(pageUrl: String): Caught? {
+        val found = CompletableDeferred<Caught>()
+        var webView: WebView? = null
+        Log.d(TAG, "webview start: $pageUrl")
+        withContext(Dispatchers.Main) {
+            val context = getContext() as? Context ?: return@withContext
+            webView = WebView(context).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val url = request.url.toString()
+                        if (TRACE_URL.containsMatchIn(url)) {
+                            Log.d(TAG, "webview request: ${request.method} ${request.url.host}${(request.url.path ?: "").take(40)}")
+                        }
+                        if (MASTER_URL.containsMatchIn(url) && !found.isCompleted) {
+                            found.complete(Caught(url, request.requestHeaders ?: emptyMap()))
+                        }
+                        return null
+                    }
+                }
+                loadUrl(pageUrl, mapOf("Referer" to "$mainUrl/"))
+            }
+        }
+        if (webView == null) {
+            Log.d(TAG, "no context for a WebView")
+            return null
+        }
+        var lastState = ""
+        val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) {
+            while (!found.isCompleted) {
+                delay(2000)
+                withContext(Dispatchers.Main) {
+                    webView?.evaluateJavascript(PICK_SOURCE_JS) { state ->
+                        if (state != lastState) {
+                            lastState = state
+                            Log.d(TAG, "page state: $state")
+                        }
+                    }
+                }
+            }
+            found.await()
+        }
+        withContext(Dispatchers.Main) {
+            webView?.stopLoading()
+            webView?.destroy()
+            webView = null
+        }
+        if (caught == null) Log.d(TAG, "no master playlist, last page state: $lastState")
+        else Log.d(TAG, "stream: ${caught.url.substringAfter("://").substringBefore("/")}")
+        return caught
+    }
+
     companion object {
         private const val TAG = "Vivarium"
 
@@ -103,10 +150,11 @@ class Vivarium : TmdbProvider() {
         // Requests logged while the WebView runs, to see how far the page got.
         private val TRACE_URL = Regex("""vivarium\.st/api/|itsmeowenthankyouforyourservice\.online/api/|challenges\.cloudflare\.com/""")
 
+        private const val CATCH_TIMEOUT_MS = 90_000L
+
         // Once the player is up, opens Settings > Source and picks the first HLS source; if no
-        // playlist was requested 9 s later, tries the next one. Returns a short state string; when it
-        // changes, a .png that the resolver answers locally (no network) makes the resolver run this
-        // script again so the state reaches the log.
+        // playlist was requested 9 s later, tries the next one. Run every 2 s; returns a short state
+        // string for the log.
         private const val PICK_SOURCE_JS = """
             (function () {
                 var ORDER = ['Hermes', 'Hemera', 'Nyx', 'Tyche', 'Eos', 'Theia', 'Hyperion', 'Orion', 'Hades'];
@@ -146,12 +194,7 @@ class Vivarium : TmdbProvider() {
                 }
                 if (!window.__csViv) {
                     window.__csViv = true;
-                    var last = '';
-                    setInterval(function () {
-                        tick();
-                        var s = state();
-                        if (s !== last) { last = s; new Image().src = location.origin + '/__cs_state.png?' + Date.now(); }
-                    }, 1500);
+                    setInterval(tick, 1500);
                 }
                 return state();
             })();
