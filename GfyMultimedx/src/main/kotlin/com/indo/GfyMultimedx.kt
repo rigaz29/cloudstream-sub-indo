@@ -22,6 +22,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
 import org.json.JSONTokener
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -34,10 +35,12 @@ import org.jsoup.nodes.Element
  *
  * Playback goes through the site's own player and cannot be automated: each start asks for an
  * interactive Cloudflare Turnstile check ("Verify you are human"), then plays video ads, and only
- * then does the player get its source (a signed MP4 under /_media/local/, or an HLS playlist). So
- * loadLinks shows the film page in a WebView on screen, presses the site's play button, and leaves
- * the check to the viewer. Once the player has its source, the window closes and the same URL is
- * played in CloudStream with the WebView's cookies.
+ * then does the player get its source: a signed MP4 under /_media/local/, an HLS playlist, or (for
+ * some titles) a Pixeldrain viewer, pixeldrain.com/d/<id>?embed, in an iframe. So loadLinks shows
+ * the film page in a WebView on screen, presses the site's play button, and leaves the check to the
+ * viewer. Once the player has its source, the window closes and the same URL is played in
+ * CloudStream with the WebView's cookies; a Pixeldrain share is resolved to its video file through
+ * Pixeldrain's public filesystem API.
  *
  * That WebView loads only the site, Cloudflare's check, hls.js, fonts and Pixeldrain; ad networks
  * and the site's VAST tag get an empty answer, and the page cannot navigate elsewhere. Without the
@@ -240,6 +243,17 @@ class GfyMultimedx : MainAPI() {
             null
         } ?: return false
 
+        if (caught.url.contains("pixeldrain.") || caught.url.contains("pixeldra.in")) {
+            val file = resolvePixeldrain(caught.url) ?: return false
+            callback(
+                newExtractorLink(name, "$name Pixeldrain", file, type = ExtractorLinkType.VIDEO) {
+                    this.referer = "https://pixeldrain.com/"
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+            return true
+        }
+
         val linkHeaders = mutableMapOf<String, String>()
         caught.userAgent?.let { linkHeaders["User-Agent"] = it }
         runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
@@ -261,6 +275,45 @@ class GfyMultimedx : MainAPI() {
     }
 
     private class Caught(val url: String, val userAgent: String?)
+
+    /**
+     * pixeldrain.com/d/<id>[/sub/path]?embed is a filesystem share. Its ?stat answer lists the path
+     * nodes (path[base_index] is the shared node) and, for a directory, its children; a file node is
+     * served at /api/filesystem<node.path>. Returns the video file URL, or null.
+     */
+    private suspend fun resolvePixeldrain(viewerUrl: String): String? {
+        val share = PIXELDRAIN_SHARE.find(viewerUrl)?.groupValues?.get(1) ?: run {
+            Log.d(TAG, "pixeldrain: no share id in ${viewerUrl.take(80)}")
+            return null
+        }
+        val statText = try {
+            app.get("https://pixeldrain.com/api/filesystem/$share?stat", referer = "https://pixeldrain.com/").text
+        } catch (e: Exception) {
+            Log.d(TAG, "pixeldrain stat failed: $e")
+            return null
+        }
+        return try {
+            val stat = JSONObject(statText)
+            val path = stat.getJSONArray("path")
+            val base = path.getJSONObject(stat.optInt("base_index", path.length() - 1))
+            val node = if (base.optString("type") == "file") base else {
+                val children = stat.optJSONArray("children")
+                (0 until (children?.length() ?: 0)).map { children!!.getJSONObject(it) }
+                    .filter { it.optString("type") == "file" && (it.optString("file_type").startsWith("video/") || VIDEO_NAME.containsMatchIn(it.optString("name"))) }
+                    .maxByOrNull { it.optLong("file_size") }
+            }
+            if (node == null) {
+                Log.d(TAG, "pixeldrain: no video in ${statText.take(300)}")
+                return null
+            }
+            val nodePath = node.optString("path").split('/').joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
+            Log.d(TAG, "pixeldrain: ${node.optString("name")} ${node.optString("file_type")} ${node.optLong("file_size")} bytes")
+            "https://pixeldrain.com/api/filesystem$nodePath"
+        } catch (e: Exception) {
+            Log.d(TAG, "pixeldrain stat not understood: $e ${statText.take(300)}")
+            null
+        }
+    }
 
     /**
      * Shows [pageUrl] in a WebView on screen, presses the site's play button, and waits until the
@@ -349,8 +402,9 @@ class GfyMultimedx : MainAPI() {
                 withContext(Dispatchers.Main) {
                     webView?.evaluateJavascript(PLAYER_JS) { raw ->
                         val state = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: return@evaluateJavascript
-                        if (state.startsWith("src:")) {
-                            if (!found.isCompleted) found.complete(Caught(state.removePrefix("src:"), webView?.settings?.userAgentString))
+                        if (state.startsWith("src:") || state.startsWith("pd:")) {
+                            val url = state.substringAfter(':')
+                            if (!found.isCompleted) found.complete(Caught(url, webView?.settings?.userAgentString))
                         } else if (state != lastState) {
                             lastState = state
                             Log.d(TAG, "page state: $state")
@@ -381,6 +435,10 @@ class GfyMultimedx : MainAPI() {
 
         private val PLAYLIST_URL = Regex("""\.m3u8(\?|$)""")
 
+        private val VIDEO_NAME = Regex("""\.(mp4|mkv|webm|m4v|mov)$""", RegexOption.IGNORE_CASE)
+
+        private val PIXELDRAIN_SHARE = Regex("""(?:pixeldrain\.(?:com|net|nl)|pixeldra\.in)/d/([^?#]+)""")
+
         private val TRACE_URL = Regex("""gfymultimedx\.online/(_player|_security|_media)/""")
 
         private const val SITE_HOST = "gfymultimedx.online"
@@ -406,6 +464,8 @@ class GfyMultimedx : MainAPI() {
                 var video = document.getElementById('movie-player');
                 var src = video ? (video.currentSrc || video.getAttribute('src') || '') : '';
                 if (/^https?:/.test(src)) return 'src:' + src;
+                var viewer = document.querySelector('iframe.gfy-pixeldrain-iframe');
+                if (viewer && /^https:\/\/[^\/]*pixeldra/.test(viewer.src || '')) return 'pd:' + viewer.src;
                 if (video && !window.__gfyScrolled) { window.__gfyScrolled = true; video.scrollIntoView({ block: 'center' }); }
                 var check = Array.prototype.some.call(document.querySelectorAll('h1, h2, h3, p, div'), function (e) {
                     return e.offsetParent !== null && e.children.length === 0 && /Satu langkah sebelum menonton/.test(e.innerText || '');
