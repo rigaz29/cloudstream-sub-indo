@@ -9,6 +9,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.io.ByteArrayInputStream
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -35,8 +36,12 @@ import org.jsoup.nodes.Element
  * interactive Cloudflare Turnstile check ("Verify you are human"), then plays video ads, and only
  * then does the player get its source (a signed MP4 under /_media/local/, or an HLS playlist). So
  * loadLinks shows the film page in a WebView on screen, presses the site's play button, and leaves
- * the check and the ads to the viewer. Once the player has its source, the window closes and the
- * same URL is played in CloudStream with the WebView's cookies.
+ * the check to the viewer. Once the player has its source, the window closes and the same URL is
+ * played in CloudStream with the WebView's cookies.
+ *
+ * That WebView loads only the site, Cloudflare's check, hls.js, fonts and Pixeldrain; ad networks
+ * and the site's VAST tag get an empty answer, and the page cannot navigate elsewhere. Without the
+ * ad SDK the site's player skips the video ads itself and goes on to the film.
  */
 class GfyMultimedx : MainAPI() {
     override var mainUrl = "https://gfymultimedx.online"
@@ -273,13 +278,29 @@ class GfyMultimedx : MainAPI() {
         var dialog: Dialog? = null
         Log.d(TAG, "player window: $pageUrl")
         withContext(Dispatchers.Main) {
+            val blocked = java.util.concurrent.ConcurrentHashMap<String, Int>()
             val view = WebView(activity).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
                 webViewClient = object : WebViewClient() {
+                    override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                        // Ads must not take the page elsewhere.
+                        val host = request.url.host.orEmpty()
+                        val keep = host == SITE_HOST || host == "challenges.cloudflare.com"
+                        if (!keep) Log.d(TAG, "navigation blocked: $host")
+                        return !keep
+                    }
+
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                         val url = request.url.toString()
+                        val host = request.url.host.orEmpty()
+                        if (!isAllowed(host, request.url.path.orEmpty())) {
+                            val n = (blocked[host] ?: 0) + 1
+                            blocked[host] = n
+                            if (n == 1) Log.d(TAG, "blocked: $host${(request.url.path ?: "").take(30)}")
+                            return WebResourceResponse("text/plain", "utf-8", 204, "No Content", emptyMap(), ByteArrayInputStream(ByteArray(0)))
+                        }
                         if (TRACE_URL.containsMatchIn(url)) {
                             Log.d(TAG, "webview request: ${request.method} ${request.url.host}${(request.url.path ?: "").take(40)}")
                         }
@@ -294,7 +315,7 @@ class GfyMultimedx : MainAPI() {
             webView = view
 
             val hint = TextView(activity).apply {
-                text = "Tekan Putar video, centang \"Verify you are human\", lalu tunggu iklan selesai. Video dibuka otomatis di CloudStream."
+                text = "Centang \"Verify you are human\" di halaman ini. Iklan diblokir; video dibuka otomatis di CloudStream."
                 setTextColor(Color.WHITE)
                 textSize = 13f
             }
@@ -362,6 +383,21 @@ class GfyMultimedx : MainAPI() {
 
         private val TRACE_URL = Regex("""gfymultimedx\.online/(_player|_security|_media)/""")
 
+        private const val SITE_HOST = "gfymultimedx.online"
+
+        // Hosts the player window may load: the site, Cloudflare's check, hls.js, fonts, Pixeldrain.
+        private val ALLOWED_HOSTS = setOf(
+            SITE_HOST, "challenges.cloudflare.com", "cdn.jsdelivr.net", "fonts.googleapis.com", "fonts.gstatic.com",
+            "pixeldrain.com", "pixeldrain.net", "pixeldra.in", "pixeldrain.nl"
+        )
+
+        private fun isAllowed(host: String, path: String): Boolean {
+            val h = host.removePrefix("www.")
+            if (h !in ALLOWED_HOSTS) return false
+            // The site's own VAST tag endpoint.
+            return !(h == SITE_HOST && path.startsWith("/_ads/"))
+        }
+
         // Scrolls the player into view once, presses the site's own play/resume button when it is
         // shown (never while the check window is open), and returns "src:<url>" once the player has
         // an http(s) source, else a short state for the log.
@@ -379,7 +415,7 @@ class GfyMultimedx : MainAPI() {
                 if (window.__gfyPressedAt && now - window.__gfyPressedAt < 5000) return 'pressed';
                 var button = Array.prototype.find.call(document.querySelectorAll('button'), function (e) {
                     var t = (e.innerText || '').trim();
-                    return !e.disabled && e.offsetParent !== null && /^(▶ Putar video|▶ Lanjutkan|Lanjutkan)$/.test(t);
+                    return !e.disabled && e.offsetParent !== null && /^(▶ Putar video|▶ Lanjutkan video|▶ Lanjutkan|Lanjutkan)$/.test(t);
                 });
                 if (button) { window.__gfyPressedAt = now; button.click(); return 'pressed ' + button.innerText.trim(); }
                 var busy = Array.prototype.find.call(document.querySelectorAll('button'), function (e) {
