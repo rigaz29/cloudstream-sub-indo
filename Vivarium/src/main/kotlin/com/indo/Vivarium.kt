@@ -148,19 +148,39 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
 
         private const val CATCH_TIMEOUT_MS = 90_000L
 
-        // Once the player is up, opens Settings > Source and picks the first HLS source; if no
-        // playlist was requested 9 s later, tries the next one. Run every 2 s; returns a short state
-        // string for the log.
+        // Once the player is up, opens the source list and picks the first HLS source; if no playlist
+        // was requested 9 s later, tries the next one. The source list opens from a button labelled
+        // with the current source ("Vivarium" at first) on both layouts; the desktop layout also has
+        // it under Settings > Source, used when that button is missing (the phone layout's Settings
+        // has no Source item). Run every 2 s; returns a short state string for the log.
         private const val PICK_SOURCE_JS = """
             (function () {
                 var ORDER = ['Hermes', 'Hemera', 'Nyx', 'Tyche', 'Eos', 'Theia', 'Hyperion', 'Orion', 'Hades'];
-                function find(re) {
+                var NAMES = ['Vivarium'].concat(ORDER);
+                function find(re, skip) {
                     var all = document.querySelectorAll('button, [role=button], [role=menuitem], [role=option], [role=radio], li, label');
                     for (var i = 0; i < all.length; i++) {
+                        if (all[i] === skip) continue;
                         var t = (all[i].getAttribute('aria-label') || all[i].innerText || '').trim();
                         if (re.test(t)) return all[i];
                     }
                     return null;
+                }
+                function sourceButton() {
+                    var all = document.querySelectorAll('button, [role=button]');
+                    for (var i = 0; i < all.length; i++) {
+                        var t = (all[i].getAttribute('aria-label') || all[i].innerText || '').trim();
+                        if (NAMES.indexOf(t) >= 0) return all[i];
+                    }
+                    return null;
+                }
+                function pick(idx, skip) {
+                    setTimeout(function () {
+                        var opt = find(new RegExp('^' + ORDER[idx] + '$'), skip);
+                        window.__csVivIdx = idx + 1;
+                        window.__csVivNote = opt ? 'picked ' + ORDER[idx] : 'no ' + ORDER[idx];
+                        if (opt) opt.click();
+                    }, 800);
                 }
                 function tick() {
                     if (!document.querySelector('video')) return;
@@ -168,6 +188,13 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
                     if (window.__csVivAt && now - window.__csVivAt < 9000) return;
                     var idx = window.__csVivIdx || 0;
                     if (idx >= ORDER.length) return;
+                    var button = sourceButton();
+                    if (button) {
+                        window.__csVivAt = now;
+                        button.click();
+                        pick(idx, button);
+                        return;
+                    }
                     var settings = find(/^Settings$/);
                     if (!settings) return;
                     window.__csVivAt = now;
@@ -176,17 +203,14 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
                         var source = find(/^Source/);
                         if (!source) { window.__csVivNote = 'no source item'; return; }
                         source.click();
-                        setTimeout(function () {
-                            var opt = find(new RegExp('^' + ORDER[idx] + '$'));
-                            window.__csVivIdx = idx + 1;
-                            window.__csVivNote = opt ? 'picked ' + ORDER[idx] : 'no ' + ORDER[idx];
-                            if (opt) opt.click();
-                        }, 800);
+                        pick(idx, null);
                     }, 800);
                 }
                 function state() {
+                    var b = sourceButton();
                     return 'ready=' + document.readyState + ' videos=' + document.querySelectorAll('video').length
-                        + ' settings=' + !!find(/^Settings$/) + ' ' + (window.__csVivNote || 'waiting');
+                        + ' source-button=' + (b ? (b.getAttribute('aria-label') || b.innerText || '').trim() : '-')
+                        + ' ' + (window.__csVivNote || 'waiting');
                 }
                 if (!window.__csViv) {
                     window.__csViv = true;
