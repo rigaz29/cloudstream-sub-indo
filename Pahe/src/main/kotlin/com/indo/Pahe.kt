@@ -1,5 +1,6 @@
 package com.indo
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.loadExtractor
@@ -142,7 +143,7 @@ class Pahe : MainAPI() {
         if (episodes.isNotEmpty() || isSeries) {
             return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes) {
                 this.posterUrl = poster
-                this.plot = synopsis
+                this.plot = listOfNotNull(synopsis, CATALOG_NOTE).joinToString(PLOT_SEPARATOR)
                 this.tags = genreList
                 this.year = releaseYear
                 this.score = Score.from10(rating)
@@ -151,7 +152,7 @@ class Pahe : MainAPI() {
 
         return newMovieLoadResponse(title, url, TvType.Movie, url) {
             this.posterUrl = poster
-            this.plot = synopsis
+            this.plot = listOfNotNull(synopsis, CATALOG_NOTE).joinToString(PLOT_SEPARATOR)
             this.tags = genreList
             this.year = releaseYear
             this.score = Score.from10(rating)
@@ -159,7 +160,12 @@ class Pahe : MainAPI() {
     }
 
     // -------------------------------------------------------------------------
-    // Links (belum diproses penuh — link di balik intercelestial.com/?ht=...)
+    // Links
+    //
+    // Pahe has no player: every download button (SD, GD = Google Drive via GDFlix, MG = Mega) goes
+    // through the exe.io link shortener, which asks for hCaptcha and Turnstile and a countdown
+    // before it reveals the target. That is not automated here, so titles are catalog-only; any
+    // direct host link a post may carry is still passed to the extractors.
     // -------------------------------------------------------------------------
 
     override suspend fun loadLinks(
@@ -169,24 +175,26 @@ class Pahe : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val doc = app.get(data, headers = ua).document
+        val hrefs = doc.select("a[href]").map { it.attr("href") }
 
-        doc.select("a[href]").filter { el ->
-            val href = el.attr("href")
-            href.contains("drive.google") ||
-                href.contains("mega.nz") ||
-                href.contains("pixeldrain") ||
-                href.contains("gofile") ||
-                href.contains("1fichier") ||
-                href.contains("racaty") ||
-                href.contains("mediafire")
-        }.mapNotNull { it.attr("href").ifBlank { null } }.forEach { link ->
-            loadExtractor(link, data, subtitleCallback, callback)
-        }
+        val direct = hrefs.filter { href ->
+            DIRECT_HOSTS.any { href.contains(it) }
+        }.distinct()
+        direct.forEach { link -> loadExtractor(link, data, subtitleCallback, callback) }
 
-        doc.select("iframe").mapNotNull { it.attr("src").ifBlank { null } }.forEach { src ->
-            loadExtractor(fixUrl(src), data, subtitleCallback, callback)
-        }
+        val shortened = hrefs.count { it.contains("exe.io/") }
+        Log.d("Pahe", "links: ${direct.size} direct, $shortened behind exe.io (not followed)")
+        return direct.isNotEmpty()
+    }
 
-        return true
+    companion object {
+        private val DIRECT_HOSTS = listOf(
+            "drive.google", "pixeldrain", "gofile.io", "1fichier", "racaty", "mediafire"
+        )
+
+        private const val PLOT_SEPARATOR = "\n\n"
+
+        const val CATALOG_NOTE ="Catatan: Pahe hanya menyediakan unduhan lewat pemendek link exe.io " +
+            "(CAPTCHA dan hitung mundur), jadi judul ini tidak dapat diputar di CloudStream."
     }
 }
