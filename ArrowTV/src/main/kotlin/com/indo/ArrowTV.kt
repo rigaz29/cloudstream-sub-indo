@@ -96,7 +96,8 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
 
     /**
      * Subtitles from the OpenSubtitles Stremio addon: movie/<imdb> or series/<imdb>:S:E (episode
-     * links carry the show's IMDb id). Labelled like the player does: "English", "English 2", ...
+     * links carry the show's IMDb id). Each is passed with its language name only; CloudStream
+     * numbers equal names itself ("English 1", "English 2", ...).
      */
     private suspend fun addSubtitles(link: TmdbLink, subtitleCallback: (SubtitleFile) -> Unit) {
         val imdb = link.imdbID?.takeIf { it.startsWith("tt") } ?: return
@@ -112,15 +113,10 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
             null
         }.orEmpty().filter { !it.url.isNullOrBlank() && !it.lang.isNullOrBlank() }
 
-        val count = mutableMapOf<String, Int>()
         subs.map { languageName(it.lang!!) to it.url!! }
             .sortedBy { it.first }
             .distinctBy { it.second }
-            .forEach { (language, url) ->
-                val n = (count[language] ?: 0) + 1
-                count[language] = n
-                subtitleCallback(newSubtitleFile(if (n == 1) language else "$language $n", url))
-            }
+            .forEach { (language, url) -> subtitleCallback(newSubtitleFile(language, url)) }
         Log.d(TAG, "subtitles: ${subs.size} for $path")
     }
 
