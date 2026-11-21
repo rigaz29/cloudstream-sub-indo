@@ -6,17 +6,23 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.app
 import com.lagradost.cloudstream3.metaproviders.TmdbLink
 import com.lagradost.cloudstream3.metaproviders.TmdbProvider
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
+import com.lagradost.cloudstream3.newSubtitleFile
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.SubtitleHelper
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -29,6 +35,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  * master (media.punkflix.net/s/<hash>/index.m3u8 on the first server) without any click. Open the
  * watch page in a WebView and take the first .m3u8 request; the player's own requests to its
  * source endpoints are left to the page.
+ *
+ * Subtitles: the player lists those of the OpenSubtitles Stremio addon (same files on
+ * subs5.strem.io, same count) through a proxy that refuses requests from outside the page. The
+ * addon itself is a public API for clients, so it is asked directly, by IMDb id.
  */
 class ArrowTV(private val appContext: Context) : TmdbProvider() {
     override var name = "ArrowTV"
@@ -52,11 +62,15 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
             "$mainUrl/watch/movie/$id"
         }
 
-        val caught = try {
-            catchPlaylist(pageUrl)
-        } catch (e: Exception) {
-            Log.d(TAG, "webview failed: $e")
-            null
+        val caught = coroutineScope {
+            // In parallel with the WebView, so the subtitles add no waiting.
+            launch { addSubtitles(link, subtitleCallback) }
+            try {
+                catchPlaylist(pageUrl)
+            } catch (e: Exception) {
+                Log.d(TAG, "webview failed: $e")
+                null
+            }
         } ?: return false
 
         fun header(name: String) = caught.headers.entries.firstOrNull { it.key.equals(name, true) }?.value
@@ -72,6 +86,52 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
     }
 
     private class Caught(val url: String, val headers: Map<String, String>)
+
+    private data class OsSubtitle(
+        @JsonProperty("lang") val lang: String? = null,
+        @JsonProperty("url") val url: String? = null,
+    )
+
+    private data class OsResponse(@JsonProperty("subtitles") val subtitles: List<OsSubtitle>? = null)
+
+    /**
+     * Subtitles from the OpenSubtitles Stremio addon: movie/<imdb> or series/<imdb>:S:E (episode
+     * links carry the show's IMDb id). Labelled like the player does: "English", "English 2", ...
+     */
+    private suspend fun addSubtitles(link: TmdbLink, subtitleCallback: (SubtitleFile) -> Unit) {
+        val imdb = link.imdbID?.takeIf { it.startsWith("tt") } ?: return
+        val path = if (link.season != null && link.episode != null) {
+            "series/$imdb:${link.season}:${link.episode}"
+        } else {
+            "movie/$imdb"
+        }
+        val subs = try {
+            app.get("$OPENSUBTITLES_ADDON/subtitles/$path.json").parsedSafe<OsResponse>()?.subtitles
+        } catch (e: Exception) {
+            Log.d(TAG, "subtitles failed: $e")
+            null
+        }.orEmpty().filter { !it.url.isNullOrBlank() && !it.lang.isNullOrBlank() }
+
+        val count = mutableMapOf<String, Int>()
+        subs.map { languageName(it.lang!!) to it.url!! }
+            .sortedBy { it.first }
+            .distinctBy { it.second }
+            .forEach { (language, url) ->
+                val n = (count[language] ?: 0) + 1
+                count[language] = n
+                subtitleCallback(newSubtitleFile(if (n == 1) language else "$language $n", url))
+            }
+        Log.d(TAG, "subtitles: ${subs.size} for $path")
+    }
+
+    private fun languageName(code: String): String {
+        val low = code.lowercase()
+        // OpenSubtitles' own code for Brazilian Portuguese, not in CloudStream's table.
+        if (low == "pob") return "Portuguese (Brazil)"
+        // The addon uses ISO 639-2/B codes, which CloudStream's table leaves empty for these.
+        val tag = BIBLIOGRAPHIC_TO_TERMINOLOGY[low] ?: low
+        return SubtitleHelper.fromTagToEnglishLanguageName(tag) ?: code
+    }
 
     /**
      * Opens [pageUrl] in a WebView of our own and waits for the first HLS playlist request (the
@@ -119,6 +179,14 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
         private const val TAG = "ArrowTV"
         private const val CATCH_TIMEOUT_MS = 45_000L
         private const val PLAYER_ORIGIN = "https://player.cinezo.live"
+        private const val OPENSUBTITLES_ADDON = "https://opensubtitles-v3.strem.io"
+
+        private val BIBLIOGRAPHIC_TO_TERMINOLOGY = mapOf(
+            "alb" to "sqi", "arm" to "hye", "baq" to "eus", "bur" to "mya", "chi" to "zho",
+            "cze" to "ces", "dut" to "nld", "fre" to "fra", "geo" to "kat", "ger" to "deu",
+            "gre" to "ell", "ice" to "isl", "mac" to "mkd", "mao" to "mri", "may" to "msa",
+            "per" to "fas", "rum" to "ron", "slo" to "slk", "tib" to "bod", "wel" to "cym",
+        )
 
         private val PLAYLIST_URL = Regex("""\.m3u8(\?|$)""")
 
