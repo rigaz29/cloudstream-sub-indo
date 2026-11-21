@@ -3,6 +3,7 @@ package com.indo
 import android.util.Log
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.app
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.ExtractorApi
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
@@ -118,3 +119,91 @@ class Streampoi : ExtractorApi() {
         )
     }
 }
+
+/**
+ * Vidara gets its sources from POST /api/stream inside its own page and plays them with
+ * jwplayer. Rather than making that request ourselves, open the embed in a WebView, let the
+ * page's player start (muted), and take the first .m3u8 request it makes. Requests to vidara and
+ * a short player state are logged under the Nekopoi tag, to see how far it got.
+ */
+class Vidara : ExtractorApi() {
+    override val name = "Vidara"
+    override val mainUrl = "https://vidara.to"
+    override val requiresReferer = true
+
+    override suspend fun getUrl(
+        url: String,
+        referer: String?,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        var lastState = ""
+        val request = try {
+            WebViewResolver(
+                interceptUrl = VIDARA_STREAM,
+                additionalUrls = listOf(VIDARA_TRACE),
+                userAgent = null,
+                useOkhttp = false,
+                script = VIDARA_AUTOPLAY_JS,
+                scriptCallback = { state ->
+                    if (state != lastState) {
+                        lastState = state
+                        Log.d(TAG, "vidara state: $state")
+                    }
+                },
+                timeout = 40_000L
+            ).resolveUsingWebView(
+                url = url,
+                referer = referer ?: "https://nekopoi.care/",
+                headers = emptyMap(),
+                method = "GET"
+            ) { req ->
+                Log.d(TAG, "vidara request: ${req.method} ${req.url.host}${req.url.encodedPath}")
+                false
+            }.first
+        } catch (e: Exception) {
+            Log.d(TAG, "vidara webview failed: $e")
+            null
+        }
+        if (request == null) {
+            Log.d(TAG, "vidara: no stream request, last state: $lastState")
+            return
+        }
+        val streamUrl = request.url.toString()
+        Log.d(TAG, "vidara: stream on ${request.url.host}")
+        val linkHeaders = mutableMapOf<String, String>()
+        (request.header("User-Agent") ?: WebViewResolver.webViewUserAgent)?.let { linkHeaders["User-Agent"] = it }
+        request.header("Origin")?.let { linkHeaders["Origin"] = it }
+        val linkReferer = request.header("Referer") ?: "$mainUrl/"
+        callback(newExtractorLink(name, name, streamUrl, type = ExtractorLinkType.M3U8) {
+            this.referer = linkReferer
+            this.headers = linkHeaders
+            this.quality = Qualities.Unknown.value
+        })
+    }
+}
+
+private val VIDARA_STREAM = Regex("""\.m3u8(\?|$)""")
+private val VIDARA_TRACE = Regex("""vidara\.to/""")
+
+// Starts jwplayer muted (or presses its play icon) once a second, and returns a short state
+// string for the log. The resolver only runs this when the page makes a request.
+private const val VIDARA_AUTOPLAY_JS = """
+    (function () {
+        function tick() {
+            try {
+                if (window.jwplayer) {
+                    var p = window.jwplayer();
+                    if (p && p.getState && p.getState() !== 'playing') { p.setMute && p.setMute(true); p.play && p.play(); }
+                }
+            } catch (e) {}
+            var icon = document.querySelector('.jw-display-icon-container, .jw-icon-display');
+            if (icon && (window.__csVidaraClicks || 0) < 3) { window.__csVidaraClicks = (window.__csVidaraClicks || 0) + 1; icon.click(); }
+        }
+        if (!window.__csVidara) { window.__csVidara = true; setInterval(tick, 1000); }
+        tick();
+        var st = '';
+        try { st = window.jwplayer && window.jwplayer().getState ? window.jwplayer().getState() : 'no-jw'; } catch (e) { st = 'jw-error'; }
+        return 'ready=' + document.readyState + ' jw=' + st + ' clicks=' + (window.__csVidaraClicks || 0);
+    })();
+"""
