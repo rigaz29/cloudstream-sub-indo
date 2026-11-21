@@ -75,7 +75,7 @@ class Playmogo : ExtractorApi() {
  * Look in the unpacked script (if any) and in the page, and take the jwplayer source, else the
  * first .m3u8 "file" (the other "file" entries are thumbnail tracks and images).
  */
-open class Streampoi : ExtractorApi() {
+class Streampoi : ExtractorApi() {
     override val name = "Streampoi"
     override val mainUrl = "https://streampoi.com"
     override val requiresReferer = false
@@ -117,9 +117,4 @@ open class Streampoi : ExtractorApi() {
             }
         )
     }
-}
-
-/** Streampoi under its other domain (episode pages embed either one). */
-class Stmpoi : Streampoi() {
-    override val mainUrl = "https://stmpoi.com"
 }

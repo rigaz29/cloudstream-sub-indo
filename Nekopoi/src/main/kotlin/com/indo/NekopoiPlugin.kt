@@ -10,6 +10,5 @@ class NekopoiPlugin : Plugin() {
         registerMainAPI(Nekopoi())
         registerExtractorAPI(Playmogo())
         registerExtractorAPI(Streampoi())
-        registerExtractorAPI(Stmpoi())
     }
 }
