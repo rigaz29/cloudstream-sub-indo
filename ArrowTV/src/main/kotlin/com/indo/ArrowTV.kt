@@ -2,6 +2,9 @@ package com.indo
 
 import android.content.Context
 import android.util.Log
+import android.webkit.ConsoleMessage
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -22,6 +25,7 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -145,7 +149,32 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
+                var consoleErrors = 0
+                webChromeClient = object : WebChromeClient() {
+                    override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+                        if (message.messageLevel() == ConsoleMessage.MessageLevel.ERROR && consoleErrors++ < 10) {
+                            Log.d(TAG, "console: ${message.message().take(160)} (${message.sourceId().substringAfterLast('/').take(40)}:${message.lineNumber()})")
+                        }
+                        return true
+                    }
+                }
                 webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView, url: String) {
+                        Log.d(TAG, "page finished: ${url.take(80)} title=${view.title}")
+                    }
+
+                    override fun onReceivedError(view: WebView, request: WebResourceRequest, error: WebResourceError) {
+                        if (request.isForMainFrame || request.url.host?.contains("cinezo") == true) {
+                            Log.d(TAG, "load error: ${request.url.host}${(request.url.path ?: "").take(40)} ${error.errorCode} ${error.description}")
+                        }
+                    }
+
+                    override fun onReceivedHttpError(view: WebView, request: WebResourceRequest, response: WebResourceResponse) {
+                        if (request.isForMainFrame || request.url.host?.contains("cinezo") == true) {
+                            Log.d(TAG, "http error: ${request.url.host}${(request.url.path ?: "").take(40)} ${response.statusCode}")
+                        }
+                    }
+
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                         val url = request.url.toString()
                         if (TRACE_URL.containsMatchIn(url)) {
@@ -160,13 +189,28 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
                 loadUrl(pageUrl, mapOf("Referer" to "$mainUrl/"))
             }
         }
-        val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) { found.await() }
+        var lastState = ""
+        val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) {
+            // Log what the page shows every 3 s (main frame only), to see where a load stops.
+            while (!found.isCompleted) {
+                delay(3000)
+                withContext(Dispatchers.Main) {
+                    webView?.evaluateJavascript(STATE_JS) { state ->
+                        if (state != lastState) {
+                            lastState = state
+                            Log.d(TAG, "page state: ${state.take(240)}")
+                        }
+                    }
+                }
+            }
+            found.await()
+        }
         withContext(Dispatchers.Main) {
             webView?.stopLoading()
             webView?.destroy()
             webView = null
         }
-        if (caught == null) Log.d(TAG, "no playlist within ${CATCH_TIMEOUT_MS / 1000} s")
+        if (caught == null) Log.d(TAG, "no playlist within ${CATCH_TIMEOUT_MS / 1000} s, last page state: $lastState")
         else Log.d(TAG, "stream: ${caught.url.substringAfter("://").substringBefore("/")}")
         return caught
     }
@@ -186,7 +230,20 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
 
         private val PLAYLIST_URL = Regex("""\.m3u8(\?|$)""")
 
-        // Requests logged while the WebView runs: the player and its source lookups.
-        private val TRACE_URL = Regex("""player\.cinezo\.live/embed|punkflix\.net/|yenime\.net/|flikhub\.net/""")
+        // Requests logged while the WebView runs: the watch page, a Cloudflare check, the player and
+        // its source lookups.
+        private val TRACE_URL = Regex(
+            """arrowtv\.net/watch|challenges\.cloudflare\.com|/cdn-cgi/challenge|player\.cinezo\.live/embed|punkflix\.net/|yenime\.net/|flikhub\.net/"""
+        )
+
+        private const val STATE_JS = """
+            (function () {
+                var frames = Array.prototype.map.call(document.querySelectorAll('iframe'), function (f) {
+                    return (f.src || '-').replace(/^https?:\/\//, '').slice(0, 60);
+                }).join(',');
+                var text = document.body ? document.body.innerText.replace(/\s+/g, ' ').slice(0, 100) : '';
+                return 'ready=' + document.readyState + ' title=' + document.title + ' iframes=' + frames + ' text=' + text;
+            })();
+        """
     }
 }
