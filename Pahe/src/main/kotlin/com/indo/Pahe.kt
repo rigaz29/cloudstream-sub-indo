@@ -194,7 +194,7 @@ class Pahe : MainAPI() {
 
         private const val PLOT_SEPARATOR = "\n\n"
 
-        const val CATALOG_NOTE ="Catatan: Pahe hanya menyediakan unduhan lewat pemendek link exe.io " +
+        const val CATALOG_NOTE = "Catatan: Pahe hanya menyediakan unduhan lewat pemendek link exe.io " +
             "(CAPTCHA dan hitung mundur), jadi judul ini tidak dapat diputar di CloudStream."
     }
 }
