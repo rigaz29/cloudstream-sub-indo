@@ -32,10 +32,10 @@ import kotlinx.coroutines.withTimeoutOrNull
  * CloudStream's TmdbProvider; the site itself is only used to play.
  *
  * The player's default "Vivarium" source streams through an encrypted relay into a blob: URL that
- * nothing outside the page can play. Its other sources (Hermes, Hemera, ...) load a plain HLS master
- * from <sub>.itsmeowenthankyouforyourservice.online/api/cs/<id>/master.m3u8. So open the watch page
- * in a WebView, switch the player to one of those sources through its own Settings > Source menu,
- * and take the master playlist it requests. Nothing is decrypted here.
+ * nothing outside the page can play. Some other sources (Hyperion, Hermes, Hemera) load a plain HLS
+ * master from <sub>.itsmeowenthankyouforyourservice.online/api/cs/<id>/master.m3u8. So open the watch
+ * page in a WebView, switch the player to one of those through its own source list, and take the
+ * master playlist it requests. Nothing is decrypted here.
  *
  * Subtitles come from the OpenSubtitles Stremio addon (a public API for clients), by IMDb id.
  */
