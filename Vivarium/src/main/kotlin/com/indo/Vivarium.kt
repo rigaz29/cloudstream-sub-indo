@@ -18,7 +18,6 @@ import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -115,8 +114,8 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
         }
         var lastState = ""
         val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) {
-            while (!found.isCompleted) {
-                delay(2000)
+            // Every 2 s, unless the playlist comes first (a plain delay held it back up to 2 s).
+            while (withTimeoutOrNull(2000) { found.await() } == null) {
                 withContext(Dispatchers.Main) {
                     webView?.evaluateJavascript(PICK_SOURCE_JS) { state ->
                         if (state != lastState) {
