@@ -25,7 +25,6 @@ import com.lagradost.cloudstream3.utils.newExtractorLink
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -143,6 +142,7 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
     private suspend fun catchPlaylist(pageUrl: String): Caught? {
         val found = CompletableDeferred<Caught>()
         var webView: WebView? = null
+        var playerSeen = false
         Log.d(TAG, "webview start: $pageUrl")
         withContext(Dispatchers.Main) {
             webView = WebView(appContext).apply {
@@ -180,6 +180,7 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
                         if (TRACE_URL.containsMatchIn(url)) {
                             Log.d(TAG, "webview request: ${request.method} ${request.url.host}${(request.url.path ?: "").take(40)}")
                         }
+                        if (PLAYER_URL.containsMatchIn(url)) playerSeen = true
                         if (PLAYLIST_URL.containsMatchIn(url) && !found.isCompleted) {
                             found.complete(Caught(url, request.requestHeaders ?: emptyMap()))
                         }
@@ -190,11 +191,20 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
             }
         }
         var lastState = ""
+        val startedAt = System.currentTimeMillis()
+        var reloaded = false
         val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) {
-            // Log what the page shows every 3 s (main frame only), to see where a load stops.
-            while (!found.isCompleted) {
-                delay(3000)
+            // Every 3 s, unless the playlist comes first: log what the page shows (main frame only),
+            // and once, if the page has not asked for the Cinezo player after 10 s, reload it (seen on
+            // a phone: the player never came, while the same page loaded it a few minutes later).
+            while (withTimeoutOrNull(3000) { found.await() } == null) {
+                val reload = !playerSeen && !reloaded && System.currentTimeMillis() - startedAt > PLAYER_WAIT_MS
+                if (reload) {
+                    reloaded = true
+                    Log.d(TAG, "no player after ${PLAYER_WAIT_MS / 1000} s, reloading")
+                }
                 withContext(Dispatchers.Main) {
+                    if (reload) webView?.reload()
                     webView?.evaluateJavascript(STATE_JS) { state ->
                         if (state != lastState) {
                             lastState = state
@@ -218,6 +228,7 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
     companion object {
         private const val TAG = "ArrowTV"
         private const val CATCH_TIMEOUT_MS = 45_000L
+        private const val PLAYER_WAIT_MS = 10_000L
         private const val PLAYER_ORIGIN = "https://player.cinezo.live"
         private const val OPENSUBTITLES_ADDON = "https://opensubtitles-v3.strem.io"
 
@@ -229,6 +240,7 @@ class ArrowTV(private val appContext: Context) : TmdbProvider() {
         )
 
         private val PLAYLIST_URL = Regex("""\.m3u8(\?|$)""")
+        private val PLAYER_URL = Regex("""player\.cinezo\.live/embed/""")
 
         // Requests logged while the WebView runs: the watch page, a Cloudflare check, the player and
         // its source lookups.
