@@ -149,14 +149,15 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
         private const val CATCH_TIMEOUT_MS = 90_000L
 
         // Once the player is up, opens the source list and picks the first HLS source; if no playlist
-        // was requested 9 s later, tries the next one. The source list opens from a button labelled
+        // was requested 4 s later (a working source asks for it at once), tries the next one. The source list opens from a button labelled
         // with the current source ("Vivarium" at first) on both layouts; the desktop layout also has
         // it under Settings > Source, used when that button is missing (the phone layout's Settings
         // has no Source item). Run every 2 s; returns a short state string for the log.
         private const val PICK_SOURCE_JS = """
             (function () {
-                var ORDER = ['Hermes', 'Hemera', 'Nyx', 'Tyche', 'Eos', 'Theia', 'Hyperion', 'Orion', 'Hades'];
-                var NAMES = ['Vivarium'].concat(ORDER);
+                // Only these load an HLS master; Nyx, Tyche, Eos, Theia, Orion and Hades never did.
+                var ORDER = ['Hyperion', 'Hermes', 'Hemera'];
+                var NAMES = ['Vivarium', 'Hermes', 'Hemera', 'Nyx', 'Tyche', 'Eos', 'Theia', 'Hyperion', 'Orion', 'Hades'];
                 function find(re, skip) {
                     var all = document.querySelectorAll('button, [role=button], [role=menuitem], [role=option], [role=radio], li, label');
                     for (var i = 0; i < all.length; i++) {
@@ -179,13 +180,19 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
                         var opt = find(new RegExp('^' + ORDER[idx] + '$'), skip);
                         window.__csVivIdx = idx + 1;
                         window.__csVivNote = opt ? 'picked ' + ORDER[idx] : 'no ' + ORDER[idx];
-                        if (opt) opt.click();
+                        if (opt) {
+                            opt.click();
+                        } else {
+                            // Not offered for this title: close the list and try the next one at once.
+                            if (skip) skip.click();
+                            window.__csVivAt = 0;
+                        }
                     }, 800);
                 }
                 function tick() {
                     if (!document.querySelector('video')) return;
                     var now = Date.now();
-                    if (window.__csVivAt && now - window.__csVivAt < 9000) return;
+                    if (window.__csVivAt && now - window.__csVivAt < 4000) return;
                     var idx = window.__csVivIdx || 0;
                     if (idx >= ORDER.length) return;
                     var button = sourceButton();
