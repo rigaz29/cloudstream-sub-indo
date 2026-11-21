@@ -1,15 +1,43 @@
 package com.indo
 
+import android.app.Dialog
+import android.graphics.Color
+import android.util.Log
+import android.view.ViewGroup
+import android.webkit.CookieManager
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.ExtractorLink
 import com.lagradost.cloudstream3.utils.ExtractorLinkType
-import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
-import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
-import org.json.JSONObject
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONTokener
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 
+/**
+ * gfymultimedx.online.
+ *
+ * The catalog (home shelves, genres, search) is open. Film and episode pages answer with a redirect
+ * to the home page unless the request carries the site as Referer.
+ *
+ * Playback goes through the site's own player and cannot be automated: each start asks for an
+ * interactive Cloudflare Turnstile check ("Verify you are human"), then plays video ads, and only
+ * then does the player get its source (a signed MP4 under /_media/local/, or an HLS playlist). So
+ * loadLinks shows the film page in a WebView on screen, presses the site's play button, and leaves
+ * the check and the ads to the viewer. Once the player has its source, the window closes and the
+ * same URL is played in CloudStream with the WebView's cookies.
+ */
 class GfyMultimedx : MainAPI() {
     override var mainUrl = "https://gfymultimedx.online"
     override var name = "GfyMultimedx"
@@ -23,45 +51,40 @@ class GfyMultimedx : MainAPI() {
         "Referer" to "$mainUrl/"
     )
 
-    private fun getAuthHeaders(): Map<String, String> {
-        val cookie = com.lagradost.cloudstream3.CommonActivity.activity?.let { ctx ->
-            try {
-                ctx.getSharedPreferences("nonton_indo_prefs", android.content.Context.MODE_PRIVATE)
-                    .getString("gfy_session_cookie", null)
-            } catch (_: Exception) {
-                null
-            }
-        }
-        return if (!cookie.isNullOrBlank()) {
-            headers + mapOf("Cookie" to cookie)
-        } else {
-            headers
-        }
-    }
-
+    // /film, /serial and /anime now redirect to the home page, which holds the shelves instead.
     override val mainPage = mainPageOf(
-        "$mainUrl/film" to "Film Terbaru",
-        "$mainUrl/serial" to "Serial TV",
-        "$mainUrl/anime" to "Anime",
-        "$mainUrl/genre/action" to "Action",
-        "$mainUrl/genre/horror" to "Horor",
+        HOME to "Beranda",
+        "$mainUrl/genre/aksi" to "Aksi",
+        "$mainUrl/genre/kengerian" to "Horor",
         "$mainUrl/genre/drama" to "Drama",
-        "$mainUrl/genre/comedy" to "Komedi",
-        "$mainUrl/genre/thriller" to "Thriller"
+        "$mainUrl/genre/komedi" to "Komedi",
+        "$mainUrl/genre/cerita-seru" to "Thriller"
     )
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        if (request.data == HOME) {
+            if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
+            val doc = app.get("$mainUrl/", headers = headers).document
+            // Each shelf: section.cinema-shelf with an h2 title and a.web-media-link cards.
+            val shelves = doc.select("section.cinema-shelf").mapNotNull { shelf ->
+                val title = shelf.selectFirst("h2")?.text()?.trim().orEmpty()
+                val items = shelf.select("a.web-media-link").mapNotNull { toSearchResponse(it) }.distinctBy { it.url }
+                if (title.isBlank() || items.isEmpty()) null else HomePageList(title, items)
+            }
+            return newHomePageResponse(shelves, false)
+        }
         val url = if (page <= 1) request.data else "${request.data}?page=$page"
         val doc = app.get(url, headers = headers).document
-        val items = doc.select("a.web-media-link, a[href*='/film/']").mapNotNull { toSearchResponse(it) }
-        return newHomePageResponse(request.name, items)
+        val items = doc.select("a.web-media-link, a[href*='/film/']").mapNotNull { toSearchResponse(it) }.distinctBy { it.url }
+        val hasNext = doc.selectFirst("a[href*='page=${page + 1}']") != null
+        return newHomePageResponse(HomePageList(request.name, items), hasNext)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val encoded = java.net.URLEncoder.encode(query.trim(), "UTF-8")
         val url = "$mainUrl/cari?q=$encoded"
         val doc = app.get(url, headers = headers).document
-        return doc.select("a.web-media-link, a[href*='/film/']").mapNotNull { toSearchResponse(it) }
+        return doc.select("a.web-media-link, a[href*='/film/']").mapNotNull { toSearchResponse(it) }.distinctBy { it.url }
     }
 
     private fun cleanTitle(raw: String): String {
@@ -116,21 +139,23 @@ class GfyMultimedx : MainAPI() {
         }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val reqHeaders = getAuthHeaders()
-        val doc = app.get(url, headers = reqHeaders).document
-
-        if (doc.select("form[data-traffic-verification]").isNotEmpty() ||
-            doc.title().contains("Akun", ignoreCase = true) ||
-            doc.location().contains("/akun/masuk")
-        ) {
-            throw ErrorLoadingException("GfyMultimedx sekarang mewajibkan login akun (Email OTP) oleh pemilik web untuk membuka film/episode.")
+    /** Film and episode pages redirect to the home page without the site as Referer. */
+    private suspend fun getPage(url: String): Document {
+        val response = app.get(url, headers = headers)
+        val finalUrl = response.url.trimEnd('/')
+        if (finalUrl == mainUrl && url.trimEnd('/') != mainUrl) {
+            throw ErrorLoadingException("GfyMultimedx mengalihkan halaman ini ke beranda.")
         }
+        return response.document
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val doc = getPage(url)
 
         val rawTitle = doc.selectFirst("h1")?.text()?.trim()
             ?: doc.selectFirst("meta[property='og:title']")?.attr("content")?.trim()
             ?: "GfyMultimedx"
-        val title = cleanTitle(rawTitle)
+        val title = cleanTitle(rawTitle.removeSuffix(" - gfymultimedx"))
 
         val poster = doc.selectFirst("meta[property='og:image']")?.attr("content")
             ?: doc.selectFirst("video[poster]")?.attr("poster")
@@ -142,12 +167,8 @@ class GfyMultimedx : MainAPI() {
         val year = Regex("""\b(19\d{2}|20\d{2})\b""").find(doc.text())?.groupValues?.getOrNull(1)?.toIntOrNull()
         val tags = doc.select("a[href*='/genre/']").map { it.text().trim() }.filter { it.isNotBlank() }.distinct()
 
-        val trailerUrl = doc.selectFirst("[data-web-trailer]")?.attr("data-web-trailer")?.ifBlank { null }?.let {
-            if (it.startsWith("http")) it else "https://www.youtube.com/watch?v=$it"
-        }
-
         val epLinks = doc.select("a[href*='/season-'][href*='/episode-']")
-        val isSeries = epLinks.isNotEmpty() || url.contains("/serial")
+        val isSeries = epLinks.isNotEmpty()
 
         return if (isSeries) {
             val episodes = epLinks.mapIndexedNotNull { index, a ->
@@ -168,17 +189,9 @@ class GfyMultimedx : MainAPI() {
                     this.season = sNum
                     this.episode = eNum
                 }
-            }.ifEmpty {
-                listOf(
-                    newEpisode(url) {
-                        this.name = "Episode 1"
-                        this.season = 1
-                        this.episode = 1
-                    }
-                )
-            }
+            }.distinctBy { it.data }.sortedWith(compareBy({ it.season }, { it.episode }))
 
-            val isAnime = tags.any { it.contains("anime", ignoreCase = true) } || url.contains("/anime")
+            val isAnime = tags.any { it.contains("anime", ignoreCase = true) }
             val tvType = if (isAnime) TvType.Anime else TvType.TvSeries
 
             newTvSeriesLoadResponse(title, url, tvType, episodes) {
@@ -203,19 +216,8 @@ class GfyMultimedx : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val reqHeaders = getAuthHeaders()
-        val pageResp = app.get(data, headers = reqHeaders)
-        val doc = pageResp.document
-
-        if (doc.select("form[data-traffic-verification]").isNotEmpty() ||
-            doc.title().contains("Akun", ignoreCase = true) ||
-            pageResp.url.contains("/akun/masuk")
-        ) {
-            throw ErrorLoadingException("GfyMultimedx sekarang mewajibkan login akun (Email OTP) oleh pemilik web untuk memutar video.")
-        }
-
-        // 1. Extract subtitles from <track>
-        doc.select("track[kind='subtitles'], track[src]").forEach { track ->
+        // Subtitles are plain <track> files on the page.
+        runCatching { getPage(data) }.getOrNull()?.select("video#movie-player track[src], track[kind='subtitles'][src]")?.forEach { track ->
             val subUrl = fixUrlNull(track.attr("src")) ?: return@forEach
             val rawLang = track.attr("label").ifBlank { track.attr("srclang") }.ifBlank { "Indonesia" }
             val label = when (rawLang.lowercase()) {
@@ -226,91 +228,165 @@ class GfyMultimedx : MainAPI() {
             subtitleCallback(newSubtitleFile(label, subUrl))
         }
 
-        var foundStream = false
+        val caught = try {
+            playThroughSite(data)
+        } catch (e: Exception) {
+            Log.d(TAG, "player window failed: $e")
+            null
+        } ?: return false
 
-        // 2. Extract video from data-gfy-deferred-source
-        val video = doc.selectFirst("video[data-gfy-deferred-source]")
-        val deferredSource = video?.attr("data-gfy-deferred-source")
+        val linkHeaders = mutableMapOf<String, String>()
+        caught.userAgent?.let { linkHeaders["User-Agent"] = it }
+        runCatching { CookieManager.getInstance().getCookie(mainUrl) }.getOrNull()
+            ?.takeIf { it.isNotBlank() }?.let { linkHeaders["Cookie"] = it }
+        val isHls = caught.url.contains(".m3u8")
+        callback(
+            newExtractorLink(
+                name,
+                name,
+                caught.url,
+                type = if (isHls) ExtractorLinkType.M3U8 else ExtractorLinkType.VIDEO
+            ) {
+                this.referer = data
+                this.headers = linkHeaders
+                this.quality = Qualities.Unknown.value
+            }
+        )
+        return true
+    }
 
-        if (!deferredSource.isNullOrBlank()) {
-            try {
-                val endpoint = fixUrl(deferredSource)
-                val postResp = app.post(
-                    endpoint,
-                    headers = mapOf(
-                        "Accept" to "application/json",
-                        "X-Requested-With" to "XMLHttpRequest",
-                        "Referer" to data,
-                        "Origin" to mainUrl
-                    ),
-                    cookies = pageResp.cookies
-                ).text
+    private class Caught(val url: String, val userAgent: String?)
 
-                val json = JSONObject(postResp)
-                val streamUrl = json.optString("url")
-                val isHls = json.optString("type") == "hls" || streamUrl.contains(".m3u8")
-
-                if (streamUrl.isNotBlank() && streamUrl.startsWith("http")) {
-                    if (isHls) {
-                        try {
-                            val m3u8Links = M3u8Helper.generateM3u8(this.name, streamUrl, mainUrl)
-                            if (m3u8Links.isNotEmpty()) {
-                                m3u8Links.forEach { callback(it) }
-                                foundStream = true
-                            } else {
-                                callback(
-                                    newExtractorLink(
-                                        this.name,
-                                        this.name,
-                                        streamUrl,
-                                        type = ExtractorLinkType.M3U8
-                                    ) {
-                                        this.referer = mainUrl
-                                    }
-                                )
-                                foundStream = true
-                            }
-                        } catch (_: Exception) {
-                            callback(
-                                newExtractorLink(
-                                    this.name,
-                                    this.name,
-                                    streamUrl,
-                                    type = ExtractorLinkType.M3U8
-                                ) {
-                                    this.referer = mainUrl
-                                }
-                            )
-                            foundStream = true
+    /**
+     * Shows [pageUrl] in a WebView on screen, presses the site's play button, and waits until the
+     * player has its source: the http(s) src of video#movie-player (direct MP4 or native HLS), or an
+     * .m3u8 request when the page plays through hls.js. The Turnstile check and the ads are left to
+     * the viewer; nothing here touches them. Closing the window cancels.
+     */
+    private suspend fun playThroughSite(pageUrl: String): Caught? {
+        val activity = CommonActivity.activity ?: run {
+            Log.d(TAG, "no activity to show the player window")
+            return null
+        }
+        val found = CompletableDeferred<Caught?>()
+        var webView: WebView? = null
+        var dialog: Dialog? = null
+        Log.d(TAG, "player window: $pageUrl")
+        withContext(Dispatchers.Main) {
+            val view = WebView(activity).apply {
+                settings.javaScriptEnabled = true
+                settings.domStorageEnabled = true
+                settings.mediaPlaybackRequiresUserGesture = false
+                webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                        val url = request.url.toString()
+                        if (TRACE_URL.containsMatchIn(url)) {
+                            Log.d(TAG, "webview request: ${request.method} ${request.url.host}${(request.url.path ?: "").take(40)}")
                         }
-                    } else {
-                        callback(
-                            newExtractorLink(
-                                this.name,
-                                this.name,
-                                streamUrl,
-                                type = ExtractorLinkType.VIDEO
-                            ) {
-                                this.referer = mainUrl
-                                this.quality = Qualities.P1080.value
-                            }
-                        )
-                        foundStream = true
+                        if (PLAYLIST_URL.containsMatchIn(url) && !found.isCompleted) {
+                            val ua = request.requestHeaders?.entries?.firstOrNull { it.key.equals("User-Agent", true) }?.value
+                            found.complete(Caught(url, ua))
+                        }
+                        return null
                     }
                 }
-            } catch (_: Exception) {
             }
+            webView = view
+
+            val hint = TextView(activity).apply {
+                text = "Tekan Putar video, centang \"Verify you are human\", lalu tunggu iklan selesai. Video dibuka otomatis di CloudStream."
+                setTextColor(Color.WHITE)
+                textSize = 13f
+            }
+            val close = Button(activity).apply { text = "Tutup" }
+            val bar = LinearLayout(activity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(24, 12, 12, 12)
+                addView(hint, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                addView(close)
+            }
+            val root = LinearLayout(activity).apply {
+                orientation = LinearLayout.VERTICAL
+                setBackgroundColor(Color.BLACK)
+                addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                addView(view, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+            }
+            dialog = Dialog(activity, android.R.style.Theme_DeviceDefault_NoActionBar_Fullscreen).apply {
+                setContentView(root)
+                setOnDismissListener { if (!found.isCompleted) found.complete(null) }
+                close.setOnClickListener { dismiss() }
+                show()
+            }
+            view.loadUrl(pageUrl, mapOf("Referer" to "$mainUrl/"))
         }
 
-        // 3. Fallback: check for iframes
-        doc.select("iframe.external-embed, .player iframe, iframe[src]").forEach { iframe ->
-            val src = fixUrlNull(iframe.attr("src")) ?: return@forEach
-            if (!src.contains("quge5") && !src.contains("adsterra") && !src.contains("highrevenueformat")) {
-                loadExtractor(src, data, subtitleCallback, callback)
-                foundStream = true
+        var lastState = ""
+        val caught = withTimeoutOrNull(WINDOW_TIMEOUT_MS) {
+            // Every 1.5 s, unless the source comes first: press the play button when it is shown
+            // and read the player's state and source.
+            while (withTimeoutOrNull(1500) { found.await() } == null && !found.isCompleted) {
+                withContext(Dispatchers.Main) {
+                    webView?.evaluateJavascript(PLAYER_JS) { raw ->
+                        val state = runCatching { JSONTokener(raw).nextValue() as? String }.getOrNull() ?: return@evaluateJavascript
+                        if (state.startsWith("src:")) {
+                            if (!found.isCompleted) found.complete(Caught(state.removePrefix("src:"), webView?.settings?.userAgentString))
+                        } else if (state != lastState) {
+                            lastState = state
+                            Log.d(TAG, "page state: $state")
+                        }
+                    }
+                }
             }
+            found.await()
         }
+        withContext(Dispatchers.Main) {
+            webView?.stopLoading()
+            webView?.destroy()
+            webView = null
+            runCatching { dialog?.dismiss() }
+            dialog = null
+        }
+        if (caught == null) Log.d(TAG, "no source, last page state: $lastState")
+        else Log.d(TAG, "source: ${caught.url.substringBefore("?").take(60)}")
+        return caught
+    }
 
-        return foundStream
+    companion object {
+        private const val TAG = "GfyMultimedx"
+        private const val HOME = "home"
+
+        // The viewer needs time for the check and the ads (about 35 s in a test).
+        private const val WINDOW_TIMEOUT_MS = 5 * 60 * 1000L
+
+        private val PLAYLIST_URL = Regex("""\.m3u8(\?|$)""")
+
+        private val TRACE_URL = Regex("""gfymultimedx\.online/(_player|_security|_media)/""")
+
+        // Scrolls the player into view once, presses the site's own play/resume button when it is
+        // shown (never while the check window is open), and returns "src:<url>" once the player has
+        // an http(s) source, else a short state for the log.
+        private const val PLAYER_JS = """
+            (function () {
+                var video = document.getElementById('movie-player');
+                var src = video ? (video.currentSrc || video.getAttribute('src') || '') : '';
+                if (/^https?:/.test(src)) return 'src:' + src;
+                if (video && !window.__gfyScrolled) { window.__gfyScrolled = true; video.scrollIntoView({ block: 'center' }); }
+                var check = Array.prototype.some.call(document.querySelectorAll('h1, h2, h3, p, div'), function (e) {
+                    return e.offsetParent !== null && e.children.length === 0 && /Satu langkah sebelum menonton/.test(e.innerText || '');
+                });
+                if (check) return 'check open';
+                var now = Date.now();
+                if (window.__gfyPressedAt && now - window.__gfyPressedAt < 5000) return 'pressed';
+                var button = Array.prototype.find.call(document.querySelectorAll('button'), function (e) {
+                    var t = (e.innerText || '').trim();
+                    return !e.disabled && e.offsetParent !== null && /^(▶ Putar video|▶ Lanjutkan|Lanjutkan)$/.test(t);
+                });
+                if (button) { window.__gfyPressedAt = now; button.click(); return 'pressed ' + button.innerText.trim(); }
+                var busy = Array.prototype.find.call(document.querySelectorAll('button'), function (e) {
+                    return e.offsetParent !== null && /Memuat|Menyiapkan/.test(e.innerText || '');
+                });
+                return busy ? 'busy ' + busy.innerText.trim() : 'waiting';
+            })();
+        """
     }
 }
