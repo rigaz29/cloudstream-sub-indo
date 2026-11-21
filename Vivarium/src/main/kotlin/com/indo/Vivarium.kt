@@ -281,7 +281,10 @@ class Vivarium(private val appContext: Context) : TmdbProvider() {
                 // Phone test (Avatar Aang): Hyperion/Hermes/Hemera load /api/cs/.../master.m3u8, Tyche and
                 // Theia an HLS playlist at /c?t=, Eos an MP4, Nyx a playlist that did not start in 12 s;
                 // Orion answered 404 and Hades nothing, and the default "Vivarium" plays a blob.
-                var ORDER = ['Hyperion', 'Hermes', 'Hemera', 'Tyche', 'Theia', 'Eos', 'Nyx'];
+                // TEST BUILD: films try Tyche first, episodes Eos first.
+                var ORDER = location.pathname.indexOf('/s/') === 0
+                    ? ['Eos', 'Tyche', 'Theia', 'Hyperion', 'Hermes', 'Hemera', 'Nyx']
+                    : ['Tyche', 'Eos', 'Theia', 'Hyperion', 'Hermes', 'Hemera', 'Nyx'];
                 var NAMES = ['Vivarium', 'Hermes', 'Hemera', 'Nyx', 'Tyche', 'Eos', 'Theia', 'Hyperion', 'Orion', 'Hades'];
                 function find(re, skip) {
                     var all = document.querySelectorAll('button, [role=button], [role=menuitem], [role=option], [role=radio], li, label');
