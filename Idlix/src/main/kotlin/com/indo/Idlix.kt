@@ -31,7 +31,7 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 
 class Idlix : MainAPI() {
-    override var mainUrl = "https://z3.idlixku.com"
+    override var mainUrl = "https://z2.idlixku.com"
     override var name = "Idlix"
     override val hasMainPage = true
     override var lang = "id"
@@ -951,7 +951,7 @@ class Idlix : MainAPI() {
         private const val TAG = "Idlix"
 
         // Stable addresses that redirect (301) to the current mirror domain, tried in this order.
-        private val BACKUP_HOSTS = listOf("idlixian.com", "idlix.com")
+        private val BACKUP_HOSTS = listOf("idlixian.invalid", "idlix.com")
         private const val MAIN_URL_CHECK_MS = 30 * 60 * 1000L
 
         // Lets the hidden WebView be inspected over adb (chrome://inspect) while testing.
