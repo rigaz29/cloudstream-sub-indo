@@ -340,7 +340,7 @@ class GfyMultimedx : MainAPI() {
                     override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                         // Ads must not take the page elsewhere.
                         val host = request.url.host.orEmpty()
-                        val keep = host == SITE_HOST || host == "challenges.cloudflare.com"
+                        val keep = host == SITE_HOST || isChallengeHost(host)
                         if (!keep) Log.d(TAG, "navigation blocked: $host")
                         return !keep
                     }
@@ -449,8 +449,13 @@ class GfyMultimedx : MainAPI() {
             "pixeldrain.com", "pixeldrain.net", "pixeldra.in", "pixeldrain.nl"
         )
 
+        // Turnstile also loads from subdomains such as brunhild.challenges.cloudflare.com.
+        private fun isChallengeHost(host: String) =
+            host == "challenges.cloudflare.com" || host.endsWith(".challenges.cloudflare.com")
+
         private fun isAllowed(host: String, path: String): Boolean {
             val h = host.removePrefix("www.")
+            if (isChallengeHost(h)) return true
             if (h !in ALLOWED_HOSTS) return false
             // The site's own VAST tag endpoint.
             return !(h == SITE_HOST && path.startsWith("/_ads/"))
