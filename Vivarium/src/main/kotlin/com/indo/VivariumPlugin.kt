@@ -7,6 +7,6 @@ import com.lagradost.cloudstream3.plugins.Plugin
 @CloudstreamPlugin
 class VivariumPlugin : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(Vivarium())
+        registerMainAPI(Vivarium(context.applicationContext))
     }
 }

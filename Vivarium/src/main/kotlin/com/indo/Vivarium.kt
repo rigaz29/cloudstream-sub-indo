@@ -7,7 +7,6 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import com.lagradost.api.getContext
 import com.lagradost.cloudstream3.SubtitleFile
 import com.lagradost.cloudstream3.TvType
 import com.lagradost.cloudstream3.metaproviders.TmdbLink
@@ -33,7 +32,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * in a WebView, switch the player to one of those sources through its own Settings > Source menu,
  * and take the master playlist it requests. Nothing is decrypted here.
  */
-class Vivarium : TmdbProvider() {
+class Vivarium(private val appContext: Context) : TmdbProvider() {
     override var name = "Vivarium"
     override var mainUrl = "https://vivarium.st"
     override var lang = "en"
@@ -93,8 +92,9 @@ class Vivarium : TmdbProvider() {
         var webView: WebView? = null
         Log.d(TAG, "webview start: $pageUrl")
         withContext(Dispatchers.Main) {
-            val context = getContext() as? Context ?: return@withContext
-            webView = WebView(context).apply {
+            // The plugin's own Context: com.lagradost.api.getContext() resolves to the JVM build of the
+            // library at compile time, which the app does not have (NoClassDefFoundError).
+            webView = WebView(appContext).apply {
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.mediaPlaybackRequiresUserGesture = false
@@ -112,10 +112,6 @@ class Vivarium : TmdbProvider() {
                 }
                 loadUrl(pageUrl, mapOf("Referer" to "$mainUrl/"))
             }
-        }
-        if (webView == null) {
-            Log.d(TAG, "no context for a WebView")
-            return null
         }
         var lastState = ""
         val caught = withTimeoutOrNull(CATCH_TIMEOUT_MS) {
