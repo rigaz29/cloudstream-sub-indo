@@ -1,5 +1,6 @@
 package com.indo
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
@@ -8,6 +9,8 @@ import com.lagradost.cloudstream3.utils.M3u8Helper
 import com.lagradost.cloudstream3.utils.Qualities
 import com.lagradost.cloudstream3.utils.loadExtractor
 import com.lagradost.cloudstream3.utils.newExtractorLink
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.jsoup.nodes.Document
 
 class Anichin : MainAPI() {
@@ -18,12 +21,53 @@ class Anichin : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.TvSeries)
 
+    // Keys, not URLs: mainUrl can move to a new domain (see ensureMainUrl).
+    // The home page has no "Popular Today" block any more; it has "Rilisan Terbaru" and a
+    // "Rekomendasi" block with one tab per genre.
     override val mainPage = mainPageOf(
-        "$mainUrl/" to "Popular Today",
-        "$mainUrl/" to "Latest Release",
+        LATEST to "Rilisan Terbaru",
+        RECOMMENDED to "Rekomendasi",
     )
 
-    private fun parseItems(doc: Document, selector: String): List<SearchResponse> {
+    private var mainUrlCheckedAt = 0L
+    private val mainUrlLock = Mutex()
+
+    /**
+     * anichin.care is the site's official landing page: it points to the current main domain with a
+     * meta refresh and a "Main Website" link (anichin.moe now; it also lists old domains). Read it at
+     * most once per MAIN_URL_CHECK_MS and switch mainUrl when it points elsewhere; when it cannot be
+     * read, the last known domain stays.
+     */
+    private suspend fun ensureMainUrl() {
+        if (System.currentTimeMillis() - mainUrlCheckedAt < MAIN_URL_CHECK_MS) return
+        mainUrlLock.withLock {
+            if (System.currentTimeMillis() - mainUrlCheckedAt < MAIN_URL_CHECK_MS) return
+            mainUrlCheckedAt = System.currentTimeMillis()
+            val doc = runCatching { app.get(BACKUP_URL, timeout = 8L).document }
+                .onFailure { Log.d(TAG, "backup page failed: $it") }.getOrNull() ?: return
+            val refresh = doc.selectFirst("meta[http-equiv=refresh]")?.attr("content")
+                ?.let { Regex("""url\s*=\s*(\S+)""", RegexOption.IGNORE_CASE).find(it)?.groupValues?.get(1) }
+            val button = doc.select("a[href]").firstOrNull { it.text().contains("Main Website", true) }?.attr("href")
+            val target = (refresh ?: button)?.let { Regex("""^(https?://[^/]+)""").find(it.trim())?.groupValues?.get(1) }
+            if (target == null || !target.contains("anichin") || target.contains(BACKUP_HOST)) {
+                Log.d(TAG, "backup page gave no main domain, keeping $mainUrl")
+                return
+            }
+            if (target != mainUrl) {
+                Log.d(TAG, "main domain moved: $mainUrl -> $target (via $BACKUP_HOST)")
+                mainUrl = target
+            }
+        }
+    }
+
+    /** Links stored from an older domain: keep their path, use the current domain. */
+    private fun onCurrentDomain(url: String): String {
+        val full = fixUrl(url)
+        val m = Regex("""^https?://[^/]*anichin[^/]*(/.*)?$""").find(full) ?: return full
+        return mainUrl + (m.groupValues[1].ifBlank { "/" })
+    }
+
+    private fun parseItems(doc: org.jsoup.nodes.Element, selector: String): List<SearchResponse> {
         return doc.select(selector).mapNotNull { item ->
             val a = item.selectFirst(".bsx > a") ?: return@mapNotNull null
             val href = fixUrl(a.attr("href"))
@@ -52,24 +96,34 @@ class Anichin : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (request.name == "Popular Today") {
-            val doc = app.get(mainUrl).document
-            val items = parseItems(doc, ".releases.hothome + .listupd article.bs, .popularslider article.bs")
-            return newHomePageResponse(request.name, items)
+        ensureMainUrl()
+        if (request.data == RECOMMENDED) {
+            if (page > 1) return newHomePageResponse(emptyList<HomePageList>(), false)
+            val doc = app.get("$mainUrl/").document
+            // .series-gen: a.nav-tabs link per genre (#series-<id>) and a .tab-pane with that id.
+            val gen = doc.selectFirst(".series-gen") ?: return newHomePageResponse(emptyList<HomePageList>(), false)
+            val rows = gen.select("ul.nav-tabs a[href^=#]").mapNotNull { tab ->
+                val pane = gen.getElementById(tab.attr("href").removePrefix("#")) ?: return@mapNotNull null
+                val items = parseItems(pane, "article.bs")
+                if (items.isEmpty()) null else HomePageList("${request.name}: ${tab.text().trim()}", items)
+            }
+            return newHomePageResponse(rows, false)
         }
 
-        val doc = app.get(if (page > 1) "$mainUrl/page/$page/" else mainUrl).document
+        val doc = app.get(if (page > 1) "$mainUrl/page/$page/" else "$mainUrl/").document
         val items = parseItems(doc, ".releases.latesthome + .listupd article.bs, .listupd.normal article.bs")
-        return newHomePageResponse(request.name, items)
+        return newHomePageResponse(HomePageList(request.name, items), items.isNotEmpty())
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/?s=$query").document
+        ensureMainUrl()
+        val doc = app.get("$mainUrl/?s=${java.net.URLEncoder.encode(query, "UTF-8")}").document
         return parseItems(doc, "div.listupd article.bs")
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val fullUrl = fixUrl(url)
+        ensureMainUrl()
+        val fullUrl = onCurrentDomain(url)
         val doc = app.get(fullUrl).document
 
         val breadcrumbSeries = doc.selectFirst(".ts-breadcrumb [itemprop=itemListElement]:nth-child(2) a [itemprop=name]")?.text()?.trim()
@@ -222,33 +276,67 @@ class Anichin : MainAPI() {
         } catch (_: Exception) { }
     }
 
+    /**
+     * rumble.com/embedJS answers with a Cloudflare challenge now; the embed page itself carries the
+     * sources: "hls":{"auto":{"url":".../playlist.m3u8"}} (adaptive) among the "ua" entries.
+     */
     private suspend fun extractRumble(url: String, callback: (ExtractorLink) -> Unit) {
         try {
             val videoId = Regex("""(?:embed/|v=)([a-zA-Z0-9]+)""").find(url)?.groupValues?.getOrNull(1) ?: return
-            val apiUrl = "https://rumble.com/embedJS/u3/?request=video&v=$videoId"
-            val jsonText = app.get(apiUrl).text
-            val data = tryParseJson<Map<String, Any?>>(jsonText) ?: return
-            val ua = data["ua"] as? Map<*, *> ?: return
-
-            ua.forEach { (key, value) ->
-                val qInt = key.toString().toIntOrNull()
-                val list = value as? List<*> ?: return@forEach
-                val streamUrl = list.firstOrNull()?.toString()?.takeIf { it.isNotBlank() } ?: return@forEach
-                val quality = when (qInt) {
-                    1080 -> Qualities.P1080.value
-                    720 -> Qualities.P720.value
-                    480 -> Qualities.P480.value
-                    360 -> Qualities.P360.value
-                    else -> Qualities.Unknown.value
+            val page = app.get("https://rumble.com/embed/$videoId/").text.replace("\\/", "/")
+            val hls = Regex(""""hls"\s*:\s*\{\s*"auto"\s*:\s*\{\s*"url"\s*:\s*"([^"]+)"""").find(page)?.groupValues?.get(1)
+                ?: Regex("""https://rumble\.com/hls-vod/[^"\s]+\.m3u8[^"\s]*""").find(page)?.value
+                ?: return
+            callback.invoke(
+                newExtractorLink("Rumble", "Rumble", hls) {
+                    this.referer = "https://rumble.com/"
+                    this.type = ExtractorLinkType.M3U8
+                    this.quality = Qualities.Unknown.value
                 }
-                callback.invoke(
-                    newExtractorLink("Rumble", "Rumble ${qInt ?: ""}p".trim(), streamUrl) {
-                        this.quality = quality
-                        this.type = ExtractorLinkType.VIDEO
-                    }
-                )
-            }
-        } catch (_: Exception) { }
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "rumble failed: $e")
+        }
+    }
+
+    /**
+     * Streamruby (embeds on nuvorel.top and other mirrors, an XFileSharing host): the embed page has
+     * a plain jwplayer setup, sources: [{file:"https://<cdn>.streamruby.net/.../master.m3u8?..."}].
+     */
+    private suspend fun extractStreamruby(url: String, callback: (ExtractorLink) -> Unit) {
+        try {
+            val html = app.get(url, referer = "$mainUrl/").text
+            val m3u8 = Regex("""sources\s*:\s*\[\s*\{\s*file\s*:\s*"([^"]+)"""").find(html)?.groupValues?.get(1)
+                ?: Regex("""https?://[^\s"'<>]+\.m3u8[^\s"'<>]*""").find(html)?.value
+                ?: return
+            val origin = Regex("""^(https?://[^/]+)""").find(url)?.groupValues?.get(1) ?: url
+            val links = M3u8Helper.generateM3u8("Streamruby", m3u8, "$origin/")
+            if (links.isNotEmpty()) links.forEach(callback) else callback.invoke(
+                newExtractorLink("Streamruby", "Streamruby", m3u8) {
+                    this.referer = "$origin/"
+                    this.type = ExtractorLinkType.M3U8
+                }
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "streamruby failed: $e")
+        }
+    }
+
+    /** Odysee embed pages carry the file in their JSON-LD "contentUrl". */
+    private suspend fun extractOdysee(url: String, callback: (ExtractorLink) -> Unit) {
+        try {
+            val html = app.get(url).text
+            val file = Regex(""""contentUrl"\s*:\s*"(https?://[^"]+)"""").find(html)?.groupValues?.get(1) ?: return
+            callback.invoke(
+                newExtractorLink("Odysee", "Odysee", file) {
+                    this.referer = "https://odysee.com/"
+                    this.type = ExtractorLinkType.VIDEO
+                    this.quality = Qualities.Unknown.value
+                }
+            )
+        } catch (e: Exception) {
+            Log.d(TAG, "odysee failed: $e")
+        }
     }
 
     private suspend fun extractOkru(url: String, callback: (ExtractorLink) -> Unit) {
@@ -324,6 +412,18 @@ class Anichin : MainAPI() {
             fullUrl.contains("playmogo.com") || fullUrl.contains("dood") -> {
                 extractPlaymogo(fullUrl, callback)
             }
+            fullUrl.contains("nuvorel.") || fullUrl.contains("streamruby") || fullUrl.contains("rubystm") -> {
+                extractStreamruby(fullUrl, callback)
+            }
+            fullUrl.contains("odysee.com") -> {
+                extractOdysee(fullUrl, callback)
+            }
+            // A Dailymotion player behind a wrapper (player.nunadrama.sbs/index.php?video=<id>,
+            // geo.dailymotion.com/player/...?video=<id>): hand the video to the Dailymotion extractor.
+            fullUrl.contains("nunadrama") || fullUrl.contains("geo.dailymotion.com") -> {
+                val id = Regex("""[?&]video=([A-Za-z0-9]+)""").find(fullUrl)?.groupValues?.get(1)
+                if (id != null) loadExtractor("https://www.dailymotion.com/embed/video/$id", data, subtitleCallback, callback)
+            }
             else -> {
                 loadExtractor(fullUrl, data, subtitleCallback, callback)
             }
@@ -336,19 +436,24 @@ class Anichin : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(fixUrl(data)).document
+        ensureMainUrl()
+        val pageUrl = onCurrentDomain(data)
+        val doc = app.get(pageUrl).document
 
+        // Every embed once: the player iframe is usually also one of the mirror options.
+        val embeds = linkedMapOf<String, String>()
         doc.select("#embed_holder iframe[src], .player-embed iframe[src], #pembed iframe[src]").forEach { iframe ->
             val src = iframe.attr("src").trim().ifBlank { return@forEach }
-            extractUrl(src, data, subtitleCallback, callback)
+            embeds.putIfAbsent(fullEmbedUrl(src), "player")
         }
 
         doc.select("select.mirror option").forEach { option ->
             val encoded = option.attr("value").trim().ifBlank { return@forEach }
             if (encoded.length < 10) return@forEach
+            val label = option.text().trim()
 
             if (encoded.startsWith("http://") || encoded.startsWith("https://")) {
-                extractUrl(encoded, data, subtitleCallback, callback)
+                embeds.putIfAbsent(fullEmbedUrl(encoded), label)
                 return@forEach
             }
 
@@ -358,13 +463,31 @@ class Anichin : MainAPI() {
                     .find(decoded)?.groupValues?.getOrNull(1)?.trim()
                     ?: Regex("""https?://[^\s"'<>]+""").find(decoded)?.value
 
-                if (!iframeSrc.isNullOrBlank()) {
-                    extractUrl(iframeSrc, data, subtitleCallback, callback)
-                }
+                if (!iframeSrc.isNullOrBlank()) embeds.putIfAbsent(fullEmbedUrl(iframeSrc), label)
             } catch (_: Exception) { }
         }
 
-        return true
+        var total = 0
+        embeds.forEach { (url, label) ->
+            var count = 0
+            extractUrl(url, pageUrl, subtitleCallback) { link -> count++; callback(link) }
+            total += count
+            Log.d(TAG, "embed $label ${url.substringAfter("://").substringBefore("/")}: $count link(s)")
+        }
+        return total > 0
+    }
+
+    private fun fullEmbedUrl(url: String) = if (url.startsWith("//")) "https:$url" else url
+
+    companion object {
+        private const val TAG = "Anichin"
+        private const val LATEST = "latest"
+        private const val RECOMMENDED = "recommended"
+
+        // Official landing page that points to the current main domain.
+        private const val BACKUP_HOST = "anichin.care"
+        private const val BACKUP_URL = "https://$BACKUP_HOST/"
+        private const val MAIN_URL_CHECK_MS = 30 * 60 * 1000L
     }
 }
 
