@@ -90,6 +90,7 @@ class Anichin : MainAPI() {
 
             newAnimeSearchResponse(title, href, tvType) {
                 this.posterUrl = poster
+                this.posterHeaders = imageHeaders()
                 addSub(epNum)
             }
         }.distinctBy { it.url }
@@ -216,6 +217,7 @@ class Anichin : MainAPI() {
             return newAnimeLoadResponse(title, fullUrl, tvType) {
                 engName = title
                 posterUrl = poster
+                posterHeaders = imageHeaders()
                 addEpisodes(DubStatus.Subbed, sortedEpisodes)
                 showStatus = status
                 this.year = year
@@ -226,6 +228,7 @@ class Anichin : MainAPI() {
 
         return newMovieLoadResponse(title, fullUrl, TvType.AnimeMovie, fullUrl) {
             this.posterUrl = poster
+            this.posterHeaders = imageHeaders()
             this.plot = synopsis
             this.tags = tags
         }
@@ -479,6 +482,10 @@ class Anichin : MainAPI() {
 
     private fun fullEmbedUrl(url: String) = if (url.startsWith("//")) "https:$url" else url
 
+    // The site's images (/wp-content/uploads) answer 403 unless the request carries the site as
+    // Referer and a browser User-Agent (OkHttp's own agent is refused even with the Referer).
+    private fun imageHeaders() = mapOf("Referer" to "$mainUrl/", "User-Agent" to BROWSER_UA)
+
     companion object {
         private const val TAG = "Anichin"
         private const val LATEST = "latest"
@@ -488,6 +495,9 @@ class Anichin : MainAPI() {
         private const val BACKUP_HOST = "anichin.care"
         private const val BACKUP_URL = "https://$BACKUP_HOST/"
         private const val MAIN_URL_CHECK_MS = 30 * 60 * 1000L
+
+        private const val BROWSER_UA =
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Mobile Safari/537.36"
     }
 }
 
