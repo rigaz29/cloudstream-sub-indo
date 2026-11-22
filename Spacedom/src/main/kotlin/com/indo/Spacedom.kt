@@ -43,7 +43,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  * requests in the following seconds are taken, one per host. How the code is made is not looked
  * into, and nothing here calls the site's API or reads its scripts.
  *
- * The site's segment CDN refuses foreign Referers, so links carry the site as Referer and Origin.
+ * The page sends these hosts no Referer (and some an Origin of "null"); the links send what the page
+ * sent, as the segment CDN refuses foreign Referers (sparkwick answered 403 to the site as Referer).
  * Subtitles come from the OpenSubtitles Stremio addon by IMDb id.
  */
 class Spacedom(private val appContext: Context) : TmdbProvider() {
@@ -78,8 +79,11 @@ class Spacedom(private val appContext: Context) : TmdbProvider() {
 
         streams.forEach { stream ->
             val cookie = runCatching { CookieManager.getInstance().getCookie(stream.url) }.getOrNull()?.takeIf { it.isNotBlank() }
-            val headers = mutableMapOf("Origin" to mainUrl)
+            // Send what the page sent: it gives these hosts no Referer at all, an Origin of the site
+            // to some and "null" to others (sparkwick answered 403 to the site as Referer).
+            val headers = mutableMapOf<String, String>()
             stream.userAgent?.let { headers["User-Agent"] = it }
+            stream.origin?.takeIf { it != "null" }?.let { headers["Origin"] = it }
             val isDash = stream.url.contains(".mpd")
             val label = stream.url.substringAfter("://").substringBefore("/")
                 .split('.').let { parts -> if (parts.size >= 2) parts[parts.size - 2] else parts.first() }
@@ -90,7 +94,7 @@ class Spacedom(private val appContext: Context) : TmdbProvider() {
                     stream.url,
                     type = if (isDash) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                 ) {
-                    this.referer = "$mainUrl/"
+                    this.referer = stream.referer.orEmpty()
                     this.headers = if (cookie != null) headers + ("Cookie" to cookie) else headers
                     this.quality = stream.height ?: Qualities.Unknown.value
                 }
@@ -100,9 +104,9 @@ class Spacedom(private val appContext: Context) : TmdbProvider() {
         return streams.isNotEmpty()
     }
 
-    private class Stream(val url: String, val userAgent: String?, val height: Int?)
+    private class Stream(val url: String, val userAgent: String?, val origin: String?, val referer: String?, val height: Int?)
 
-    private class Seen(val at: Long, val url: String, val userAgent: String?)
+    private class Seen(val at: Long, val url: String, val userAgent: String?, val origin: String?, val referer: String?)
 
     /**
      * Search -> candidate codes -> watch pages until /api/availability/<type>/<id> matches -> collect
@@ -126,8 +130,8 @@ class Spacedom(private val appContext: Context) : TmdbProvider() {
                             if (m.groupValues[1] == type) availability.add(System.currentTimeMillis() to (m.groupValues[2].toIntOrNull() ?: -1))
                         }
                         if (MANIFEST.containsMatchIn(url) && !url.contains("proxy2.spacedom")) {
-                            val ua = request.requestHeaders?.entries?.firstOrNull { it.key.equals("User-Agent", true) }?.value
-                            manifests.add(Seen(System.currentTimeMillis(), url, ua))
+                            fun header(name: String) = request.requestHeaders?.entries?.firstOrNull { it.key.equals(name, true) }?.value
+                            manifests.add(Seen(System.currentTimeMillis(), url, header("User-Agent"), header("Origin"), header("Referer")?.takeIf { it.isNotBlank() }))
                         }
                         return null
                     }
@@ -201,8 +205,8 @@ class Spacedom(private val appContext: Context) : TmdbProvider() {
         return seen.groupBy { it.url.substringAfter("://").substringBefore("/") }.map { (_, list) ->
             val master = list.firstOrNull { MASTER_NAME.containsMatchIn(it.url) || it.url.contains(".mpd") }
             val chosen = master ?: list.maxByOrNull { heightOf(it.url) ?: 0 }!!
-            Stream(chosen.url, chosen.userAgent, if (master == null) heightOf(chosen.url) else null)
-        }.also { streams -> streams.forEach { Log.d(TAG, "stream: ${it.url.substringAfter("://").substringBefore("?").take(80)}") } }
+            Stream(chosen.url, chosen.userAgent, chosen.origin, chosen.referer, if (master == null) heightOf(chosen.url) else null)
+        }.also { streams -> streams.forEach { Log.d(TAG, "stream: ${it.url.substringAfter("://").substringBefore("?").take(80)} origin=${it.origin} referer=${it.referer}") } }
     }
 
     private fun heightOf(url: String): Int? = Regex("""/(\d{3,4})x(\d{3,4})/""").find(url)?.groupValues?.get(2)?.toIntOrNull()
