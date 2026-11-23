@@ -42,7 +42,8 @@ import java.util.concurrent.ConcurrentLinkedQueue
  *
  * loadLinks opens the player in a hidden WebView, takes the manifest the default server loads, then
  * picks each other Live/Online server through the player's own menu and takes the manifest (HLS or
- * DASH) it loads next: one link per server. The servers' lookups are left to the player; nothing
+ * DASH, sometimes behind the player's proxy, ?url=<manifest>) it loads next: one link per server.
+ * The servers' lookups are left to the player; nothing
  * here calls them. Links send what the player sent (Origin, Referer).
  *
  * Subtitles come from the OpenSubtitles Stremio addon by IMDb id.
@@ -91,7 +92,7 @@ class Cinezo(private val appContext: Context) : TmdbProvider() {
                     name,
                     "$name ${stream.server}",
                     stream.url,
-                    type = if (stream.url.substringBefore("?").endsWith(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
+                    type = if (innerUrl(stream.url).substringBefore("?").endsWith(".mpd")) ExtractorLinkType.DASH else ExtractorLinkType.M3U8
                 ) {
                     this.referer = stream.referer.orEmpty()
                     this.headers = headers
@@ -120,7 +121,7 @@ class Cinezo(private val appContext: Context) : TmdbProvider() {
                 webViewClient = object : WebViewClient() {
                     override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
                         val url = request.url.toString()
-                        if (MANIFEST.containsMatchIn(url)) {
+                        if (isManifest(url)) {
                             fun header(name: String) = request.requestHeaders?.entries?.firstOrNull { it.key.equals(name, true) }?.value
                             manifests.add(Seen(System.currentTimeMillis(), url, header("User-Agent"), header("Origin"), header("Referer")?.takeIf { it.isNotBlank() }))
                         }
@@ -146,7 +147,9 @@ class Cinezo(private val appContext: Context) : TmdbProvider() {
         // A manifest is new unless it is the same URL or an HLS playlist next to one already taken
         // (the variant and audio playlists of a master sit in the master's folder).
         fun isNew(seen: Seen): Boolean = streams.none { taken ->
-            taken.url == seen.url || (seen.url.contains(".m3u8") && taken.url.contains(".m3u8") && folder(taken.url) == folder(seen.url))
+            val t = innerUrl(taken.url)
+            val n = innerUrl(seen.url)
+            taken.url == seen.url || (n.contains(".m3u8") && t.contains(".m3u8") && folder(t) == folder(n))
         }
 
         suspend fun waitForManifest(since: Long, timeoutMs: Long): Seen? {
@@ -204,6 +207,19 @@ class Cinezo(private val appContext: Context) : TmdbProvider() {
     }
 
     private fun folder(url: String) = url.substringBefore("?").substringBeforeLast("/")
+
+    /**
+     * Some servers play through a proxy that carries the real address in its "url" parameter
+     * (Sadie: proxy1.flikhub.net/api?url=<...>/index_287.m3u8?...); that inner address tells
+     * what the request is.
+     */
+    private fun innerUrl(url: String): String {
+        val raw = Regex("""[?&]url=([^&]+)""").find(url)?.groupValues?.get(1) ?: return url
+        val decoded = runCatching { java.net.URLDecoder.decode(raw, "UTF-8") }.getOrNull() ?: return url
+        return if (decoded.startsWith("http")) decoded else url
+    }
+
+    private fun isManifest(url: String) = MANIFEST.containsMatchIn(url) || MANIFEST.containsMatchIn(innerUrl(url))
 
     private data class OsSubtitle(
         @JsonProperty("lang") val lang: String? = null,
