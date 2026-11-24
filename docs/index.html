@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CloudStream Sub Indo - CloudStream repo for Indonesian anime, donghua and film (sub indo)</title>
+  <meta name="description" content="CloudStream 3 extension repository for Indonesian sub indo anime, donghua, film and drama sites (Idlix, Anichin, Kuronime, Oploverz, GfyMultimedx) and English streaming sites (Cinezo, Spacedom, ArrowTV, Atlantic, Vivarium). Add one repository URL and install the plugins.">
+  <link rel="canonical" href="https://rigaz29.github.io/cloudstream-sub-indo/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="CloudStream Sub Indo - CloudStream repo for sub indo anime and film">
+  <meta property="og:description" content="CloudStream 3 extensions for Indonesian sub indo anime, donghua, film and drama sites, plus English streaming sites.">
+  <meta property="og:url" content="https://rigaz29.github.io/cloudstream-sub-indo/">
+  <meta name="twitter:card" content="summary">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "CloudStream Sub Indo",
+    "description": "CloudStream 3 extensions for Indonesian sub indo anime, donghua, film and drama sites, plus English streaming sites.",
+    "codeRepository": "https://github.com/rigaz29/cloudstream-sub-indo",
+    "programmingLanguage": "Kotlin",
+    "runtimePlatform": "Android, CloudStream 3",
+    "license": "https://opensource.org/licenses/MIT",
+    "keywords": "cloudstream, cloudstream repo, cloudstream extensions, sub indo, subtitle indonesia, anime, donghua, film, drama"
+  }
+  </script>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #1f2328;
+      --muted: #59636e;
+      --line: #d1d9e0;
+      --panel: #f6f8fa;
+      --accent: #0969da;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0d1117;
+        --fg: #e6edf3;
+        --muted: #9198a1;
+        --line: #3d444d;
+        --panel: #151b23;
+        --accent: #4493f8;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    }
+    main { max-width: 860px; margin: 0 auto; padding: 32px 16px 48px; }
+    h1 { font-size: 2rem; margin: 0 0 8px; }
+    h2 { font-size: 1.3rem; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 1px solid var(--line); }
+    p { margin: 0 0 12px; }
+    a { color: var(--accent); }
+    .lead { color: var(--muted); font-size: 1.05rem; }
+    ol { padding-left: 22px; }
+    .url {
+      display: flex; gap: 8px; align-items: stretch; margin: 8px 0 16px;
+    }
+    .url code {
+      flex: 1; min-width: 0; overflow-x: auto; white-space: nowrap;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+      padding: 8px 10px; font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+    button {
+      border: 1px solid var(--line); background: var(--panel); color: var(--fg);
+      border-radius: 6px; padding: 0 14px; font: inherit; cursor: pointer;
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.95rem; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    .table { overflow-x: auto; }
+    footer { margin-top: 40px; color: var(--muted); font-size: 0.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>CloudStream Sub Indo</h1>
+  <p class="lead">A CloudStream 3 extension repository for Indonesian anime, donghua, film and drama sites with Indonesian subtitles (sub indo), plus English film and series sites.</p>
+  <p>Add the repository once in CloudStream on Android and the sites show up as providers: search, browse, and play episodes and films from Idlix, Anichin, Kuronime, Oploverz, GfyMultimedx, Cinezo, Spacedom and more.</p>
+
+  <h2>Add the repository to CloudStream</h2>
+  <ol>
+    <li>Install <a href="https://github.com/recloudstream/cloudstream">CloudStream 3</a> on Android.</li>
+    <li>Open <strong>Settings &gt; Extensions</strong> and tap <strong>Add repository</strong>.</li>
+    <li>Enter this URL:</li>
+  </ol>
+  <div class="url">
+    <code id="repo-url">https://raw.githubusercontent.com/rigaz29/cloudstream-sub-indo/builds/repo.json</code>
+    <button type="button" id="copy">Copy</button>
+  </div>
+  <p>Then open the repository and install the plugins you want. Installed plugins update from it.</p>
+
+  <h2>Anime and donghua (sub indo)</h2>
+  <div class="table">
+  <table>
+    <tr><th>Plugin</th><th>Site</th><th>Notes</th></tr>
+    <tr><td>Anichin</td><td>anichin.moe</td><td>Donghua; follows its backup domain anichin.care</td></tr>
+    <tr><td>Kuronime</td><td>kuronime.sbs</td><td>Tap play once in the window that opens</td></tr>
+    <tr><td>Oploverz</td><td>oploverz.ch</td><td>Blogger and Upbolt mirrors</td></tr>
+    <tr><td>AnimeIndo, Animasu, CA3D, Donghub, Kuramanime, Nimegami, Otakudesu, Sokuja, YunshanID</td><td></td><td>Not re-checked in this repository</td></tr>
+  </table>
+  </div>
+
+  <h2>Film and drama (Indonesian sites)</h2>
+  <div class="table">
+  <table>
+    <tr><th>Plugin</th><th>Site</th><th>Notes</th></tr>
+    <tr><td>Idlix</td><td>z3.idlixku.com</td><td>Subtitles; follows its backup domains</td></tr>
+    <tr><td>GfyMultimedx</td><td>gfymultimedx.online</td><td>Tick the Cloudflare check in the window that opens</td></tr>
+    <tr><td>Pahe</td><td>pahe.ink</td><td>Catalog only (downloads behind a link shortener)</td></tr>
+    <tr><td>BlurayUFR, LayarAsia, MovieBox, PusatFilm</td><td></td><td>Not re-checked in this repository</td></tr>
+  </table>
+  </div>
+
+  <h2>Film and series (English sites)</h2>
+  <p>Catalog from TMDB, playback through the site's own player, subtitles from OpenSubtitles.</p>
+  <div class="table">
+  <table>
+    <tr><th>Plugin</th><th>Site</th><th>Notes</th></tr>
+    <tr><td>Cinezo</td><td>cinezo.st</td><td>One link per server; 4K on recent films</td></tr>
+    <tr><td>ArrowTV</td><td>arrowtv.net</td><td>4K on recent films</td></tr>
+    <tr><td>Spacedom</td><td>spacedom.live</td><td>Several servers, up to 4K</td></tr>
+    <tr><td>Atlantic</td><td>atlantic.bz</td><td></td></tr>
+    <tr><td>Vivarium</td><td>vivarium.st</td><td></td></tr>
+  </table>
+  </div>
+
+  <p style="margin-top:16px">The full list with status and dates is in the <a href="https://github.com/rigaz29/cloudstream-sub-indo#plugins">README on GitHub</a>.</p>
+
+  <h2>Source code</h2>
+  <p>Kotlin, MIT licensed: <a href="https://github.com/rigaz29/cloudstream-sub-indo">github.com/rigaz29/cloudstream-sub-indo</a>. Pull requests are welcome.</p>
+
+  <footer>
+    <p>The plugins only read pages that the sites publish; they do not host any content. The content belongs to third-party sites. Use the plugins in line with the laws where you live.</p>
+  </footer>
+</main>
+<script>
+  document.getElementById('copy').addEventListener('click', function () {
+    var text = document.getElementById('repo-url').textContent;
+    var button = this;
+    function done() { button.textContent = 'Copied'; setTimeout(function () { button.textContent = 'Copy'; }, 1500); }
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(done, function () {});
+    }
+  });
+</script>
+</body>
+</html>
