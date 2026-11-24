@@ -287,7 +287,7 @@ class MovieBox : MainAPI() {
                 val hls = (play["hls"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
                 if (mp4.isEmpty() && dash.isEmpty() && hls.isEmpty()) continue
 
-                fun emit(item: Map<*, *>, kind: String, type: ExtractorLinkType?) {
+                suspend fun emit(item: Map<*, *>, kind: String, type: ExtractorLinkType?) {
                     val url = item["url"]?.toString()?.takeIf { it.startsWith("http") } ?: return
                     val heights = item["resolutions"]?.toString().orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }
                     val height = heights.maxOrNull()
