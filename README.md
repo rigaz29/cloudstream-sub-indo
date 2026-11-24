@@ -26,7 +26,7 @@
 
 **CloudStream Sub Indo** is a set of [CloudStream 3](https://github.com/recloudstream/cloudstream) extensions for streaming sites: Indonesian anime, donghua, film and drama sites with Indonesian subtitles (sub indo), plus a few English film and series sites. Install the repository in CloudStream on Android and the sites show up as providers.
 
-This is a fork of [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo), formerly named rigaz29/nonton-indo; the old repository URL keeps working. Fixes and new plugins made here are sent upstream as pull requests.
+The project started as a fork of [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo) and was named rigaz29/nonton-indo; the old repository URL keeps working.
 
 ---
 
@@ -154,7 +154,7 @@ MIT License. See [LICENSE](LICENSE).
 
 ## Credits
 
-- [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo), the project this fork comes from
+- [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo), the project this one started from
 - [CloudStream 3](https://github.com/recloudstream/cloudstream)
 - [hexated](https://github.com/hexated/cloudstream-extensions-hexated), used as a reference for extensions
 - [TMDB](https://www.themoviedb.org/) for the catalog of the English-site plugins
