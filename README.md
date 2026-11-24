@@ -10,7 +10,13 @@
   <h3 align="center">CloudStream Sub Indo</h3>
 
   <p align="center">
-    CloudStream 3 extensions for Indonesian and international streaming sites
+    CloudStream repo for Indonesian anime, donghua, film and drama with Indonesian subtitles (sub indo), plus English streaming sites
+    <br />
+    <a href="https://rigaz29.github.io/cloudstream-sub-indo/">Website</a>
+    &middot;
+    <a href="#install">Install</a>
+    &middot;
+    <a href="#plugins">Plugins</a>
   </p>
 </p>
 
