@@ -1,15 +1,27 @@
 package com.indo
 
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.AppUtils.tryParseJson
 import com.lagradost.cloudstream3.utils.ExtractorLink
+import com.lagradost.cloudstream3.utils.ExtractorLinkType
 import com.lagradost.cloudstream3.utils.Qualities
+import com.lagradost.cloudstream3.utils.SubtitleHelper
 import com.lagradost.cloudstream3.utils.newExtractorLink
 import com.lagradost.nicehttp.JsonAsString
-import java.security.MessageDigest
+import java.net.URLEncoder
 
+/**
+ * MovieBox (officialmoviebox.com; themoviebox.org redirects there).
+ *
+ * The site reads its catalog from h5-api.aoneroom.com with a guest token that the API hands out in
+ * the x-user header of its home call, and gets the streams from <site>/wefeed-h5api-bff/subject/play
+ * with the watch page as Referer. This plugin makes the same calls with the same headers: MP4 (H.264)
+ * links per resolution and a DASH (HEVC) link that needs the play answer's signCookie as X-MB-Token,
+ * plus the subtitles from the caption call.
+ */
 class MovieBox : MainAPI() {
-    override var mainUrl = "https://themoviebox.org"
+    override var mainUrl = "https://officialmoviebox.com"
     private val apiBase = "https://h5-api.aoneroom.com"
 
     override var name = "MovieBox"
@@ -18,7 +30,7 @@ class MovieBox : MainAPI() {
     override val hasDownloadSupport = true
     override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
 
-    private var bearerToken: String? = null
+    private var guestToken: String? = null
 
     override val mainPage = mainPageOf(
         "872031290915189720" to "Trending",
@@ -29,58 +41,42 @@ class MovieBox : MainAPI() {
     private val baseHeaders = mapOf(
         "Accept" to "application/json",
         "User-Agent" to USER_AGENT,
-        "X-Client-Info" to "{\"timezone\":\"Asia/Jakarta\"}"
+        "X-Client-Info" to "{\"timezone\":\"Asia/Jakarta\"}",
+        "X-Request-Lang" to "en"
     )
 
-    private fun clientTimeToken(): String {
-        val ts = (System.currentTimeMillis() / 1000).toInt()
-        val rev = ts.toString().reversed()
-        val md5 = MessageDigest.getInstance("MD5").digest(rev.toByteArray())
-            .joinToString("") { "%02x".format(it) }
-        return "$ts,$md5"
+    /** The guest token the API gives every visitor (x-user header of the home call). */
+    private suspend fun token(refresh: Boolean = false): String {
+        if (!refresh) guestToken?.let { return it }
+        val host = mainUrl.substringAfter("://").substringBefore("/")
+        val resp = app.get("$apiBase/wefeed-h5api-bff/home?host=$host", headers = baseHeaders, referer = "$mainUrl/")
+        val token = tryParseJson<Map<String, Any?>>(resp.headers["x-user"] ?: "")?.get("token")?.toString()
+        if (!token.isNullOrBlank()) guestToken = token
+        else Log.d(TAG, "no guest token in the home answer")
+        return guestToken.orEmpty()
     }
 
+    private fun authHeaders(token: String) = baseHeaders + mapOf("Authorization" to "Bearer $token")
+
+    private fun isOk(raw: String?) = tryParseJson<Map<String, Any?>>(raw ?: "")?.get("code")?.toString()?.let { it == "0" || it == "0.0" } == true
+
+    /** GET on the catalog API with the guest token; asks for a new token once if the answer is not ok. */
     private suspend fun apiGet(path: String): String {
-        return app.get("$apiBase$path", headers = baseHeaders).text
-    }
-
-    private suspend fun apiPost(path: String, data: String): String {
-        val headers = baseHeaders + mapOf(
-            "Content-Type" to "application/json",
-            "Authorization" to "",
-            "X-Request-Lang" to "en",
-            "X-Client-Token" to clientTimeToken()
-        )
-        return app.post("$apiBase$path", json = JsonAsString(data), headers = headers, referer = "$mainUrl/").text ?: ""
-    }
-
-    private suspend fun getBearerToken(): String {
-        bearerToken?.let { return it }
-        val headers = baseHeaders + mapOf(
-            "Authorization" to "",
-            "X-Request-Lang" to "en",
-            "X-Client-Token" to clientTimeToken()
-        )
-        val resp = app.get("$apiBase/wefeed-h5api-bff/home?host=themoviebox.org", headers = headers, referer = "$mainUrl/")
-        val xUser = resp.headers["x-user"] ?: ""
-        val token = tryParseJson<Map<String, Any?>>(xUser)?.get("token")?.toString()
-        if (!token.isNullOrBlank()) {
-            bearerToken = token
+        var raw = app.get("$apiBase$path", headers = authHeaders(token()), referer = "$mainUrl/").text
+        if (!isOk(raw)) {
+            raw = app.get("$apiBase$path", headers = authHeaders(token(refresh = true)), referer = "$mainUrl/").text
         }
-        return bearerToken ?: ""
+        return raw
     }
 
-    private suspend fun apiGetWithToken(path: String): String {
-        val headers = baseHeaders + mapOf(
-            "Authorization" to "",
-            "X-Request-Lang" to "en",
-            "X-Client-Token" to clientTimeToken()
-        )
-        return app.get("$apiBase$path", headers = headers, referer = "$mainUrl/").text
-    }
-
-    private suspend fun tokenGet(path: String): String {
-        return app.get("$mainUrl$path", headers = baseHeaders).text
+    private suspend fun apiPost(path: String, body: String): String {
+        val headers = authHeaders(token()) + mapOf("Content-Type" to "application/json")
+        var raw = app.post("$apiBase$path", json = JsonAsString(body), headers = headers, referer = "$mainUrl/").text
+        if (!isOk(raw)) {
+            val retry = authHeaders(token(refresh = true)) + mapOf("Content-Type" to "application/json")
+            raw = app.post("$apiBase$path", json = JsonAsString(body), headers = retry, referer = "$mainUrl/").text
+        }
+        return raw
     }
 
     private fun detailPathFromUrl(url: String): String {
@@ -106,6 +102,7 @@ class MovieBox : MainAPI() {
         val root = tryParseJson<Map<String, Any?>>(raw) ?: return emptyList()
         val data = root["data"] as? Map<*, *> ?: return emptyList()
         val list = data["subjectList"] as? List<*> ?: return emptyList()
+        @Suppress("UNCHECKED_CAST")
         return list.mapNotNull { it as? Map<String, Any?> }
     }
 
@@ -134,63 +131,37 @@ class MovieBox : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val rankingId = request.data
-        val raw = apiGetWithToken("/wefeed-h5api-bff/ranking-list/content?id=$rankingId&page=$page&perPage=12")
+        val raw = apiGet("/wefeed-h5api-bff/ranking-list/content?id=${request.data}&page=$page&perPage=12")
         val items = toSubjectList(raw)
             .mapNotNull { toSearchResponseFromSubject(it) }
             .distinctBy { it.url }
-
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val token = getBearerToken()
-        if (token.isNotBlank()) {
-            val headers = baseHeaders + mapOf(
-                "Content-Type" to "application/json",
-                "Authorization" to "Bearer $token",
-                "X-Request-Lang" to "en"
-            )
-            val allItems = mutableListOf<Map<String, Any?>>()
-            var page = 1
-            val maxPages = 10
-            var hasMore = true
-
-            while (page <= maxPages && hasMore) {
-                val body = """{"keyword":"$query","page":$page,"perPage":28,"subjectType":0}"""
-                val raw = app.post("$apiBase/wefeed-h5api-bff/subject/search", json = JsonAsString(body), headers = headers, referer = "$mainUrl/").text ?: ""
-                val root = tryParseJson<Map<String, Any?>>(raw)
-                val data = root?.get("data") as? Map<*, *> ?: break
-                val pager = data["pager"] as? Map<*, *>
-                hasMore = pager?.get("hasMore") as? Boolean ?: false
-                val items = data["items"] as? List<*> ?: emptyList<Any>()
-                if (items.isEmpty()) break
-                allItems.addAll(items.mapNotNull { it as? Map<String, Any?> })
-                page++
-            }
-
-            if (allItems.isNotEmpty()) {
-                return allItems
-                    .distinctBy { it["detailPath"]?.toString() }
-                    .filter { it["detailPath"]?.toString()?.isNotBlank() == true }
-                    .mapNotNull { toSearchResponseFromSubject(it) }
-            }
+        val allItems = mutableListOf<Map<String, Any?>>()
+        var page = 1
+        var hasMore = true
+        while (page <= MAX_SEARCH_PAGES && hasMore) {
+            val keyword = query.replace("\\", "\\\\").replace("\"", "\\\"")
+            val raw = apiPost("/wefeed-h5api-bff/subject/search", """{"keyword":"$keyword","page":$page,"perPage":28,"subjectType":0}""")
+            val data = tryParseJson<Map<String, Any?>>(raw)?.get("data") as? Map<*, *> ?: break
+            hasMore = (data["pager"] as? Map<*, *>)?.get("hasMore") as? Boolean ?: false
+            val items = data["items"] as? List<*> ?: emptyList<Any>()
+            if (items.isEmpty()) break
+            @Suppress("UNCHECKED_CAST")
+            allItems.addAll(items.mapNotNull { it as? Map<String, Any?> })
+            page++
         }
-
-        val pools = mainPage.flatMap { (_, id) ->
-            val r = apiGetWithToken("/wefeed-h5api-bff/ranking-list/content?id=$id&page=1&perPage=20")
-            toSubjectList(r)
-        }
-
-        return pools
+        return allItems
             .distinctBy { it["detailPath"]?.toString() }
-            .filter { (it["title"]?.toString() ?: "").contains(query, ignoreCase = true) }
+            .filter { it["detailPath"]?.toString()?.isNotBlank() == true }
             .mapNotNull { toSearchResponseFromSubject(it) }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val detailPath = detailPathFromUrl(url)
-        val raw = apiGetWithToken("/wefeed-h5api-bff/detail?detailPath=$detailPath")
+        val raw = apiGet("/wefeed-h5api-bff/detail?detailPath=$detailPath")
 
         val root = tryParseJson<Map<String, Any?>>(raw) ?: throw ErrorLoadingException("Invalid detail response")
         val data = root["data"] as? Map<*, *> ?: throw ErrorLoadingException("Missing data")
@@ -205,7 +176,7 @@ class MovieBox : MainAPI() {
         val poster = (subject["cover"] as? Map<*, *>)?.get("url")?.toString()
         val tags = subject["genre"]?.toString()?.split(",")?.map { it.trim() }?.filter { it.isNotBlank() }.orEmpty()
         val year = subject["releaseDate"]?.toString()?.take(4)?.toIntOrNull()
-        val dubs = (subject["dubs"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
+        val pageUrl = "$mainUrl/moviesDetail/$detailPath"
 
         val seasons = (resource?.get("seasons") as? List<*>)
             ?.mapNotNull { it as? Map<*, *> }
@@ -215,23 +186,16 @@ class MovieBox : MainAPI() {
 
         if (isSeriesLike) {
             val episodes = mutableListOf<Episode>()
-
-            val primaryDubs = dubs.filter { it["type"] as? Int == 5 || it["type"] as? Int == 0 }
-            val primaryDub = primaryDubs.firstOrNull()
-            val dubSubjectId = primaryDub?.get("subjectId")?.toString() ?: subjectId
-
             seasons.forEach { s ->
                 val seasonNo = toInt(s["se"]) ?: return@forEach
                 val allEp = s["allEp"]?.toString()
                 val eps = if (!allEp.isNullOrBlank()) {
                     allEp.split(',').mapNotNull { it.trim().toIntOrNull() }
                 } else {
-                    val max = toInt(s["maxEp"]) ?: 0
-                    (1..max).toList()
+                    (1..(toInt(s["maxEp"]) ?: 0)).toList()
                 }
-
                 eps.forEach { ep ->
-                    episodes.add(newEpisode("$mainUrl/moviesDetail/$detailPath?sid=$dubSubjectId&se=$seasonNo&ep=$ep") {
+                    episodes.add(newEpisode("$pageUrl?sid=$subjectId&se=$seasonNo&ep=$ep") {
                         this.season = seasonNo
                         this.episode = ep
                         this.name = "Episode $ep"
@@ -239,7 +203,7 @@ class MovieBox : MainAPI() {
                 }
             }
 
-            return newTvSeriesLoadResponse(title, url, tvType, episodes) {
+            return newTvSeriesLoadResponse(title, pageUrl, tvType, episodes) {
                 this.posterUrl = poster
                 this.plot = plot
                 this.tags = tags
@@ -252,7 +216,7 @@ class MovieBox : MainAPI() {
         val defaultSe = toInt(firstSeason?.get("se")) ?: 0
         val defaultEp = if ((toInt(firstSeason?.get("maxEp")) ?: 0) >= 1) 1 else 0
 
-        return newMovieLoadResponse(title, url, tvType, "$mainUrl/movies/$detailPath?id=$subjectId&type=/movie/detail&detailSe=$defaultSe&detailEp=$defaultEp&lang=en") {
+        return newMovieLoadResponse(title, pageUrl, tvType, "$pageUrl?sid=$subjectId&se=$defaultSe&ep=$defaultEp") {
             this.posterUrl = poster
             this.plot = plot
             this.tags = tags
@@ -268,117 +232,112 @@ class MovieBox : MainAPI() {
         callback: (ExtractorLink) -> Unit
     ): Boolean {
         val detailPath = detailPathFromUrl(data)
-        val sid = Regex("[?&](sid|id)=([^&]+)").find(data)?.groupValues?.getOrNull(2)
+        val sid = Regex("[?&](?:sid|id)=([^&]+)").find(data)?.groupValues?.getOrNull(1)
         var se = Regex("[?&](?:se|detailSe)=(\\d+)").find(data)?.groupValues?.getOrNull(1) ?: "0"
         var ep = Regex("[?&](?:ep|detailEp)=(\\d+)").find(data)?.groupValues?.getOrNull(1) ?: "0"
 
-        val detRaw = apiGetWithToken("/wefeed-h5api-bff/detail?detailPath=$detailPath")
-        val detRoot = tryParseJson<Map<String, Any?>>(detRaw)
-        val detData = detRoot?.get("data") as? Map<*, *>
+        val detData = tryParseJson<Map<String, Any?>>(apiGet("/wefeed-h5api-bff/detail?detailPath=$detailPath"))?.get("data") as? Map<*, *>
         val detSubject = detData?.get("subject") as? Map<*, *>
         val detResource = detData?.get("resource") as? Map<*, *>
 
-        val subjectId = if (!sid.isNullOrBlank()) sid else detSubject?.get("subjectId")?.toString().orEmpty()
+        val subjectId = sid?.ifBlank { null } ?: detSubject?.get("subjectId")?.toString().orEmpty()
         if (subjectId.isBlank()) return false
 
         if (se == "0" && ep == "0") {
-            val rSeasons = (detResource?.get("seasons") as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
-            val firstS = rSeasons.firstOrNull()
+            val firstS = (detResource?.get("seasons") as? List<*>)?.mapNotNull { it as? Map<*, *> }?.firstOrNull()
             if (firstS != null && (toInt(firstS["se"]) ?: 0) >= 1) {
                 se = (toInt(firstS["se"]) ?: 1).toString()
                 ep = if ((toInt(firstS["maxEp"]) ?: 0) >= 1) "1" else "0"
             }
         }
 
-        val dubs = (detSubject?.get("dubs") as? List<*>)
-            ?.mapNotNull { it as? Map<*, *> }
-            .orEmpty()
-
-        val allDubs = dubs.ifEmpty {
-            listOf(mapOf<String, Any?>("subjectId" to subjectId, "lanName" to "Original"))
-        }
-
-        var found = false
-
-        for (dub in allDubs) {
-            val dubId = dub["subjectId"]?.toString() ?: continue
-            val dubName = dub["lanName"]?.toString() ?: "Unknown"
-
-            val tryConfigs = mutableListOf(Pair(se, ep))
-            if (se == "0" && ep == "0") {
-                tryConfigs.add(Pair("1", "1"))
-            } else {
-                tryConfigs.add(Pair("0", "0"))
+        // Dubs are separate subjects (audio or subtitle versions); try the original and the
+        // Indonesian and English ones.
+        val dubs = (detSubject?.get("dubs") as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
+            .filter { d ->
+                val code = d["lanCode"]?.toString()?.lowercase().orEmpty()
+                d["original"] == true || code.startsWith("id") || code.startsWith("in") || code.startsWith("en")
             }
+            .ifEmpty { listOf(mapOf<String, Any?>("subjectId" to subjectId, "lanName" to "Original")) }
 
-            for ((curSe, curEp) in tryConfigs) {
-                val spaReferer = "https://123movienow.cc/spa/videoPlayPage/movies/$detailPath?id=$dubId&type=/movie/detail&detailSe=$curSe&detailEp=$curEp&lang=en"
-                val headers = mapOf(
-                    "Accept" to "application/json",
-                    "User-Agent" to USER_AGENT,
-                    "X-Client-Info" to "{\"timezone\":\"Asia/Jakarta\"}",
-                    "X-Vip-Restrict" to "0",
-                    "Referer" to spaReferer
-                )
+        var found = 0
+        val subtitleUrls = HashSet<String>()
+        for (dub in dubs) {
+            val dubId = dub["subjectId"]?.toString() ?: continue
+            val dubName = dub["lanName"]?.toString()?.takeIf { dubs.size > 1 }
+            val dubPath = dub["detailPath"]?.toString()?.ifBlank { null } ?: detailPath
 
+            for ((curSe, curEp) in listOf(se to ep) + (if (se == "0" && ep == "0") listOf("1" to "1") else listOf("0" to "0"))) {
+                val watchPage = "$mainUrl/movies/$dubPath?id=$dubId&type=/movie/detail&detailSe=$curSe&detailEp=$curEp&lang=en"
                 val playRaw = app.get(
-                    "$apiBase/wefeed-h5api-bff/subject/play?subjectId=$dubId&se=$curSe&ep=$curEp&detailPath=$detailPath&streamSignType=0",
-                    headers = headers
+                    "$mainUrl/wefeed-h5api-bff/subject/play?subjectId=$dubId&se=$curSe&ep=$curEp&detailPath=$dubPath&streamSignType=1",
+                    headers = baseHeaders,
+                    referer = watchPage
                 ).text
-
-                val playRoot = tryParseJson<Map<String, Any?>>(playRaw) ?: continue
-                val playData = playRoot["data"] as? Map<*, *> ?: continue
-                val hasResource = playData["hasResource"] as? Boolean ?: false
-                if (!hasResource) continue
-
-                val streams = (playData["streams"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
-                val hls = (playData["hls"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
-                val dash = (playData["dash"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
-                val all = streams + hls + dash
-                if (all.isEmpty()) continue
-
-                all.forEach { item ->
-                    val u = item["url"]?.toString()?.takeIf { it.startsWith("http") } ?: return@forEach
-                    val res = item["resolutions"]?.toString()
-                    val streamId = item["id"]?.toString()?.takeIf { it.isNotBlank() }
-
-                    val label = if (dubs.isNotEmpty()) "$dubName ${res ?: "Auto"}" else "${res ?: "Auto"}"
-
-                    val q = when {
-                        (res ?: "").contains("1080") || u.contains("1080", true) -> Qualities.P1080.value
-                        (res ?: "").contains("720") || u.contains("720", true) -> Qualities.P720.value
-                        (res ?: "").contains("480") || u.contains("480", true) -> Qualities.P480.value
-                        (res ?: "").contains("360") || u.contains("360", true) -> Qualities.P360.value
-                        else -> Qualities.Unknown.value
-                    }
-
-                    callback(newExtractorLink(name, label, u) {
-                        this.quality = q
-                        this.referer = "https://123movienow.cc/"
-                    })
-                    found = true
-
-                    if (streamId != null) {
-                        val capRaw = app.get(
-                            "$apiBase/wefeed-h5api-bff/subject/caption?format=MP4&id=$streamId&subjectId=$dubId&detailPath=$detailPath",
-                            headers = headers
-                        ).text
-                        val capRoot = tryParseJson<Map<String, Any?>>(capRaw)
-                        val capData = capRoot?.get("data") as? Map<*, *>
-                        val captions = capData?.get("captions") as? List<*>
-                        captions?.forEach { cap ->
-                            val capMap = cap as? Map<*, *> ?: return@forEach
-                            val capUrl = capMap["url"]?.toString()?.takeIf { it.isNotBlank() } ?: return@forEach
-                            val capLang = capMap["lanName"]?.toString() ?: capMap["lan"]?.toString() ?: "Unknown"
-                            subtitleCallback(SubtitleFile(capLang, capUrl))
-                        }
-                    }
+                val play = tryParseJson<Map<String, Any?>>(playRaw)?.get("data") as? Map<*, *> ?: continue
+                if (play["hasResource"] as? Boolean != true) continue
+                if (play["vipLocked"] == true || play["limited"] == true) {
+                    // VIP-only or limited on the site itself: leave it to the site.
+                    Log.d(TAG, "${dub["lanName"] ?: "original"} se=$curSe ep=$curEp is locked (vip=${play["vipLocked"]}, limited=${play["limited"]})")
+                    continue
                 }
 
-                if (found) break
+                val mp4 = (play["streams"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
+                val dash = (play["dash"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
+                val hls = (play["hls"] as? List<*>)?.mapNotNull { it as? Map<*, *> }.orEmpty()
+                if (mp4.isEmpty() && dash.isEmpty() && hls.isEmpty()) continue
+
+                fun emit(item: Map<*, *>, kind: String, type: ExtractorLinkType?) {
+                    val url = item["url"]?.toString()?.takeIf { it.startsWith("http") } ?: return
+                    val heights = item["resolutions"]?.toString().orEmpty().split(',').mapNotNull { it.trim().toIntOrNull() }
+                    val height = heights.maxOrNull()
+                    val codec = item["codecName"]?.toString()?.uppercase()?.ifBlank { null }
+                    val label = listOfNotNull(dubName, kind, codec, height?.let { "${it}p" }).joinToString(" ")
+                    val headers = mutableMapOf("User-Agent" to USER_AGENT)
+                    item["signCookie"]?.toString()?.takeIf { it.isNotBlank() }?.let { headers["X-MB-Token"] = it }
+                    found++
+                    callback(newExtractorLink(name, "$name $label", url, type = type) {
+                        this.referer = watchPage
+                        this.headers = headers
+                        this.quality = height ?: Qualities.Unknown.value
+                    })
+                }
+                mp4.forEach { emit(it, "MP4", ExtractorLinkType.VIDEO) }
+                dash.forEach { emit(it, "DASH", ExtractorLinkType.DASH) }
+                hls.forEach { emit(it, "HLS", ExtractorLinkType.M3U8) }
+
+                // Subtitles of the first stream that has an id (the same files for every quality).
+                val captionSource = (dash.map { "DASH" to it } + mp4.map { "MP4" to it }).firstOrNull { it.second["id"] != null }
+                if (captionSource != null) {
+                    val (format, item) = captionSource
+                    val capRaw = apiGet("/wefeed-h5api-bff/subject/caption?format=$format&id=${item["id"]}&subjectId=$dubId&detailPath=$dubPath")
+                    val captions = ((tryParseJson<Map<String, Any?>>(capRaw)?.get("data") as? Map<*, *>)?.get("captions") as? List<*>)
+                        ?.mapNotNull { it as? Map<*, *> }.orEmpty()
+                    captions.forEach { cap ->
+                        val capUrl = cap["url"]?.toString()?.takeIf { it.isNotBlank() } ?: return@forEach
+                        if (!subtitleUrls.add(capUrl)) return@forEach
+                        subtitleCallback(newSubtitleFile(languageName(cap["lan"]?.toString(), cap["lanName"]?.toString()), capUrl))
+                    }
+                }
+                Log.d(TAG, "${dub["lanName"] ?: "original"} se=$curSe ep=$curEp: ${mp4.size} mp4, ${dash.size} dash, ${hls.size} hls")
+                break
             }
         }
+        Log.d(TAG, "links: $found, subtitles: ${subtitleUrls.size}")
+        return found > 0
+    }
 
-        return found
+    /** "in_id" -> Indonesian, "en" -> English, ...; falls back to the site's own (native) name. */
+    private fun languageName(code: String?, siteName: String?): String {
+        val c = code?.lowercase().orEmpty()
+        return SubtitleHelper.fromTagToEnglishLanguageName(c)
+            ?: SubtitleHelper.fromTagToEnglishLanguageName(c.substringBefore('_'))
+            ?: siteName?.ifBlank { null }
+            ?: code ?: "Unknown"
+    }
+
+    companion object {
+        private const val TAG = "MovieBox"
+        private const val MAX_SEARCH_PAGES = 10
     }
 }
