@@ -73,6 +73,13 @@
     th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
     th { color: var(--muted); font-weight: 600; }
     .table { overflow-x: auto; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; margin: 20px 0 8px; }
+    .actions a {
+      display: inline-block; padding: 9px 16px; border-radius: 6px; text-decoration: none;
+      border: 1px solid var(--line); background: var(--panel); color: var(--fg); font-weight: 600;
+    }
+    .actions a.primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+    .hint { color: var(--muted); font-size: 0.9rem; }
     footer { margin-top: 40px; color: var(--muted); font-size: 0.9rem; }
   </style>
 </head>
@@ -81,10 +88,16 @@
   <h1>CloudStream Sub Indo</h1>
   <p class="lead">A CloudStream 3 extension repository for Indonesian anime, donghua, film and drama sites with Indonesian subtitles (sub indo), plus English film and series sites.</p>
   <p>Add the repository once in CloudStream on Android and the sites show up as providers: search, browse, and play episodes and films from Idlix, Anichin, Kuronime, Oploverz, GfyMultimedx, Cinezo, Spacedom and more.</p>
+  <div class="actions">
+    <a class="primary" href="cloudstreamrepo://raw.githubusercontent.com/rigaz29/cloudstream-sub-indo/builds/repo.json">Add to CloudStream</a>
+    <a href="https://github.com/recloudstream/cloudstream/releases/latest">Download CloudStream</a>
+    <a href="https://github.com/recloudstream/cloudstream">CloudStream on GitHub</a>
+  </div>
+  <p class="hint">"Add to CloudStream" opens the app on an Android phone where CloudStream is installed and adds this repository. Elsewhere, use the URL below.</p>
 
   <h2>Add the repository to CloudStream</h2>
   <ol>
-    <li>Install <a href="https://github.com/recloudstream/cloudstream">CloudStream 3</a> on Android.</li>
+    <li>Install CloudStream on Android: download the APK from its <a href="https://github.com/recloudstream/cloudstream/releases/latest">latest release</a> (source and other builds on the <a href="https://github.com/recloudstream/cloudstream">CloudStream repository</a>).</li>
     <li>Open <strong>Settings &gt; Extensions</strong> and tap <strong>Add repository</strong>.</li>
     <li>Enter this URL:</li>
   </ol>
