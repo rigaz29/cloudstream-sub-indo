@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://github.com/rigaz29/nonton-indo">
+  <a href="https://github.com/rigaz29/cloudstream-sub-indo">
     <picture>
       <source media="(prefers-color-scheme: dark)" srcset="https://cdn-icons-png.flaticon.com/512/2920/2920297.png">
       <source media="(prefers-color-scheme: light)" srcset="https://cdn-icons-png.flaticon.com/512/3136/3136684.png">
@@ -7,7 +7,7 @@
     </picture>
   </a>
 
-  <h3 align="center">Nonton Indo</h3>
+  <h3 align="center">CloudStream Sub Indo</h3>
 
   <p align="center">
     CloudStream 3 extensions for Indonesian and international streaming sites
@@ -18,9 +18,9 @@
 
 ## About
 
-**Nonton Indo** is a set of [CloudStream 3](https://github.com/recloudstream/cloudstream) plugins for streaming sites: Indonesian anime and film sites, plus a few English film and series sites. Install the repository in CloudStream on Android and the sites show up as providers.
+**CloudStream Sub Indo** is a set of [CloudStream 3](https://github.com/recloudstream/cloudstream) extensions for streaming sites: Indonesian anime, donghua, film and drama sites with Indonesian subtitles (sub indo), plus a few English film and series sites. Install the repository in CloudStream on Android and the sites show up as providers.
 
-This is a fork of [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo). Fixes and new plugins made here are sent upstream as pull requests.
+This is a fork of [ExtremeBoyGG/nonton-indo](https://github.com/ExtremeBoyGG/nonton-indo), formerly named rigaz29/nonton-indo; the old repository URL keeps working. Fixes and new plugins made here are sent upstream as pull requests.
 
 ---
 
@@ -32,7 +32,7 @@ You need [CloudStream 3](https://github.com/recloudstream/cloudstream) on Androi
 2. Tap **Add repository** and enter:
 
    ```
-   https://raw.githubusercontent.com/rigaz29/nonton-indo/builds/repo.json
+   https://raw.githubusercontent.com/rigaz29/cloudstream-sub-indo/builds/repo.json
    ```
 
 3. Open the repository and install the plugins you want.
@@ -103,8 +103,8 @@ These take their catalog (home, search, details, seasons, episodes) from TMDB an
 Requirements: JDK 17 and the Android SDK.
 
 ```bash
-git clone https://github.com/rigaz29/nonton-indo.git
-cd nonton-indo
+git clone https://github.com/rigaz29/cloudstream-sub-indo.git
+cd cloudstream-sub-indo
 
 # Build every plugin and plugins.json (what CI runs)
 ./gradlew make makePluginsJson
