@@ -1,0 +1,8 @@
+{
+  "name": "CloudStream Sub Indo",
+  "description": "Ekstensi CloudStream untuk nonton anime, donghua, film, dan drama sub indo, plus situs streaming berbahasa Inggris",
+  "manifestVersion": 1,
+  "pluginLists": [
+    "https://raw.githubusercontent.com/rigaz29/cloudstream-sub-indo/builds/plugins.json"
+  ]
+}
