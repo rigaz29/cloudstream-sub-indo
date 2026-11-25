@@ -76,10 +76,10 @@ Branch `builds` dibangun ulang oleh GitHub Actions setiap ada push ke `main`, da
 |---|---|---|---|
 | <img src="https://www.google.com/s2/favicons?domain=z3.idlixku.com&sz=16" width="16" height="16"> Idlix | z3.idlixku.com | Jalan (2026-11-21) | Subtitle dan pembaruan token stream. Mengikuti domain cadangan (idlixian.com, idlix.com). |
 | <img src="https://www.google.com/s2/favicons?domain=gfymultimedx.online&sz=16" width="16" height="16"> GfyMultimedx | gfymultimedx.online | Jalan (2026-11-21) | Tidak perlu akun, tapi setiap kali memutar situs meminta verifikasi Cloudflare: centang di jendela yang terbuka. Iklan diblokir di jendela itu. |
+| <img src="https://www.google.com/s2/favicons?domain=officialmoviebox.com&sz=16" width="16" height="16"> MovieBox | officialmoviebox.com | Jalan (2026-11-25) | Link MP4 (H.264, sampai 1080p) dan DASH (HEVC), versi asli plus dub Inggris/Indonesia kalau ada. Subtitle dari situs, termasuk Indonesia. Judul yang dikunci VIP dilewati. |
 | <img src="https://www.google.com/s2/favicons?domain=pahe.ink&sz=16" width="16" height="16"> Pahe | pahe.ink | Hanya katalog | Situs hanya menyediakan unduhan di balik pemendek link exe.io (CAPTCHA), jadi tidak ada yang bisa diputar. |
 | <img src="https://www.google.com/s2/favicons?domain=blurayufr.site&sz=16" width="16" height="16"> BlurayUFR | blurayufr.site | Belum dicek ulang | |
 | <img src="https://www.google.com/s2/favicons?domain=server-1.layar.asia&sz=16" width="16" height="16"> LayarAsia | server-1.layar.asia | Belum dicek ulang | |
-| <img src="https://www.google.com/s2/favicons?domain=themoviebox.org&sz=16" width="16" height="16"> MovieBox | themoviebox.org | Belum dicek ulang | Domainnya sekarang dialihkan ke officialmoviebox.com. |
 | <img src="https://www.google.com/s2/favicons?domain=new1.pusatfilm21info.com&sz=16" width="16" height="16"> PusatFilm | new1.pusatfilm21info.com | Belum dicek ulang | |
 | <img src="https://www.google.com/s2/favicons?domain=tv9.nontondrama.my&sz=16" width="16" height="16"> LK21 | tv9.nontondrama.my | Situs tidak menjawab (2026-11-24) | |
 | <img src="https://www.google.com/s2/favicons?domain=139.59.197.199&sz=16" width="16" height="16"> Rebahin | 139.59.197.199 | Situs tidak menjawab (2026-11-24) | |
