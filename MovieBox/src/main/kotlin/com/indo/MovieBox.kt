@@ -306,9 +306,10 @@ class MovieBox : MainAPI() {
                 dash.forEach { emit(it, "DASH", ExtractorLinkType.DASH) }
                 hls.forEach { emit(it, "HLS", ExtractorLinkType.M3U8) }
 
-                // Subtitles of the first stream that has an id (the same files for every quality).
+                // Subtitles of the first stream that has an id (the same files for every quality), from
+                // the first version that has any: the dubs carry the same languages again.
                 val captionSource = (dash.map { "DASH" to it } + mp4.map { "MP4" to it }).firstOrNull { it.second["id"] != null }
-                if (captionSource != null) {
+                if (captionSource != null && subtitleUrls.isEmpty()) {
                     val (format, item) = captionSource
                     val capRaw = apiGet("/wefeed-h5api-bff/subject/caption?format=$format&id=${item["id"]}&subjectId=$dubId&detailPath=$dubPath")
                     val captions = ((tryParseJson<Map<String, Any?>>(capRaw)?.get("data") as? Map<*, *>)?.get("captions") as? List<*>)
